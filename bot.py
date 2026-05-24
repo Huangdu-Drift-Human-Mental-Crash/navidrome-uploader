@@ -1,8 +1,11 @@
 """
 Telegram bot: receive audio files, process metadata, save to Navidrome music folder, trigger scan.
 """
+import asyncio
+import base64
 import os
 import re
+import shlex
 import logging
 import secrets
 from pathlib import Path
@@ -10,12 +13,11 @@ from pathlib import Path
 import requests as http_requests
 from dotenv import load_dotenv
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3, TIT2, TPE1, TALB
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TCON, APIC
 from mutagen.mp3 import MP3
-from mutagen.flac import FLAC
-from mutagen.mp4 import MP4
+from mutagen.mp4 import MP4, MP4Cover
 import shutil
-import subprocess
 import tempfile
 from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
@@ -72,25 +74,72 @@ EDIT_FIELD_LABELS = {
     'artist': 'Artist',
     'title': 'Title',
     'album': 'Album',
+    'genre': 'Genre',
 }
 MAX_RECENT_UPLOADS = 50
 MAX_EDIT_UPLOAD_CHOICES = 10
 MAX_LYRICS_SETS_PER_UPLOAD = 5
+POST_HOOK_TIMEOUT = 60
 
 
 def is_allowed(user_id: int) -> bool:
     return not ALLOWED_USERS or user_id in ALLOWED_USERS
 
 
-def run_post_hook(filepath: str):
-    """Run user-defined post-processing command. {path} is replaced with the file path."""
+def build_post_hook_args(filepath: str) -> list[str]:
+    """Build a safe argv list for the configured post-processing hook."""
+    args = shlex.split(POST_HOOK)
+    return [arg.replace('{path}', filepath) for arg in args]
+
+
+def format_hook_output(output: bytes) -> str:
+    text = output.decode(errors='replace').strip()
+    if len(text) > 4000:
+        return f"{text[:4000]}... [truncated]"
+    return text
+
+
+async def run_post_hook(filepath: str):
+    """Run user-defined post-processing command without invoking a shell."""
     if not POST_HOOK:
         return
+
+    process = None
     try:
-        cmd = POST_HOOK.replace('{path}', filepath)
-        subprocess.run(cmd, shell=True, timeout=60, capture_output=True)
+        args = build_post_hook_args(filepath)
+        if not args:
+            return
+
+        env = os.environ.copy()
+        env['NAVIDROME_UPLOADER_PATH'] = filepath
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=POST_HOOK_TIMEOUT)
+        if process.returncode:
+            logger.warning(
+                "Post-hook exited with code %s for %s. stdout=%r stderr=%r",
+                process.returncode,
+                filepath,
+                format_hook_output(stdout),
+                format_hook_output(stderr),
+            )
+    except asyncio.TimeoutError:
+        if process:
+            process.kill()
+            await process.communicate()
+        logger.warning("Post-hook timed out after %s seconds for %s", POST_HOOK_TIMEOUT, filepath)
     except Exception as e:
         logger.warning(f"Post-hook failed: {e}")
+
+
+def schedule_post_hook(filepath: str):
+    """Schedule post-processing without delaying the Telegram handler."""
+    if POST_HOOK:
+        asyncio.create_task(run_post_hook(filepath))
 
 
 def trigger_scan():
@@ -112,7 +161,7 @@ def get_metadata(filepath: Path) -> dict:
     audio = MutagenFile(str(filepath))
     if audio is None:
         return {}
-    meta = {'artist': 'Unknown', 'title': filepath.stem, 'album': ''}
+    meta = {'artist': 'Unknown', 'title': filepath.stem, 'album': '', 'genre': ''}
     if getattr(audio, 'info', None) and getattr(audio.info, 'length', None):
         meta['duration'] = int(audio.info.length * 1000)
 
@@ -127,6 +176,8 @@ def get_metadata(filepath: Path) -> dict:
         meta['title'] = str(tags['TIT2'])
     if 'TALB' in tags:
         meta['album'] = str(tags['TALB'])
+    if 'TCON' in tags:
+        meta['genre'] = str(tags['TCON'])
 
     # Vorbis/FLAC
     if hasattr(tags, 'get'):
@@ -136,12 +187,15 @@ def get_metadata(filepath: Path) -> dict:
             meta['title'] = (tags.get('title') or tags.get('TITLE') or [filepath.stem])[0]
         if not meta['album']:
             meta['album'] = (tags.get('album') or tags.get('ALBUM') or [''])[0]
+        if not meta['genre']:
+            meta['genre'] = (tags.get('genre') or tags.get('GENRE') or [''])[0]
 
     # MP4
     if isinstance(audio, MP4):
         meta['artist'] = (audio.tags.get('\xa9ART') or ['Unknown'])[0]
         meta['title'] = (audio.tags.get('\xa9nam') or [filepath.stem])[0]
         meta['album'] = (audio.tags.get('\xa9alb') or [''])[0]
+        meta['genre'] = (audio.tags.get('\xa9gen') or [''])[0]
 
     return meta
 
@@ -169,6 +223,7 @@ def write_metadata(filepath: Path, meta: dict):
     artist = meta.get('artist', 'Unknown')
     title = meta.get('title', filepath.stem)
     album = meta.get('album', '')
+    genre = meta.get('genre', '')
     ext = filepath.suffix.lower()
 
     if ext == '.mp3':
@@ -176,10 +231,13 @@ def write_metadata(filepath: Path, meta: dict):
         tags.delall('TPE1')
         tags.delall('TIT2')
         tags.delall('TALB')
+        tags.delall('TCON')
         tags.add(TPE1(encoding=3, text=artist))
         tags.add(TIT2(encoding=3, text=title))
         if album:
             tags.add(TALB(encoding=3, text=album))
+        if genre:
+            tags.add(TCON(encoding=3, text=genre))
         tags.save(str(filepath))
         return
 
@@ -193,6 +251,10 @@ def write_metadata(filepath: Path, meta: dict):
             audio.tags['\xa9alb'] = [album]
         else:
             audio.tags.pop('\xa9alb', None)
+        if genre:
+            audio.tags['\xa9gen'] = [genre]
+        else:
+            audio.tags.pop('\xa9gen', None)
         audio.save()
         return
 
@@ -206,10 +268,83 @@ def write_metadata(filepath: Path, meta: dict):
                 del audio.tags['album']
             except KeyError:
                 pass
+        if genre:
+            audio.tags['genre'] = [genre]
+        else:
+            try:
+                del audio.tags['genre']
+            except KeyError:
+                pass
         audio.save()
         return
 
     raise ValueError(f"Unsupported metadata format: {ext}")
+
+
+def detect_image_mime(image_data: bytes) -> str | None:
+    if image_data.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if image_data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    return None
+
+
+def make_cover_picture(image_data: bytes, mime: str) -> Picture:
+    picture = Picture()
+    picture.type = 3
+    picture.mime = mime
+    picture.desc = 'Cover'
+    picture.data = image_data
+    return picture
+
+
+def remove_tag_if_present(tags, key: str):
+    try:
+        del tags[key]
+    except KeyError:
+        pass
+
+
+def write_cover(filepath: Path, image_data: bytes, mime: str):
+    """Write front cover art into the audio file."""
+    audio = MutagenFile(str(filepath))
+    if audio is None:
+        raise ValueError("Unsupported or unreadable audio file.")
+
+    ext = filepath.suffix.lower()
+    if ext == '.mp3':
+        tags = audio.tags or ID3()
+        tags.delall('APIC')
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc='Cover', data=image_data))
+        tags.save(str(filepath))
+        return
+
+    if isinstance(audio, MP4) or ext == '.m4a':
+        if audio.tags is None:
+            audio.add_tags()
+        image_format = MP4Cover.FORMAT_JPEG if mime == 'image/jpeg' else MP4Cover.FORMAT_PNG
+        audio.tags['covr'] = [MP4Cover(image_data, imageformat=image_format)]
+        audio.save()
+        return
+
+    picture = make_cover_picture(image_data, mime)
+    if isinstance(audio, FLAC):
+        audio.clear_pictures()
+        audio.add_picture(picture)
+        audio.save()
+        return
+
+    if ext in ('.ogg', '.opus'):
+        if audio.tags is None:
+            audio.add_tags()
+        for key in ('metadata_block_picture', 'METADATA_BLOCK_PICTURE', 'coverart', 'COVERART',
+                    'coverartmime', 'COVERARTMIME'):
+            remove_tag_if_present(audio.tags, key)
+        audio.tags['metadata_block_picture'] = [base64.b64encode(picture.write()).decode('ascii')]
+        audio.save()
+        return
+
+    raise ValueError(f"Cover editing is not supported for {ext or 'this file type'}.")
 
 
 def make_track_id(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -240,6 +375,7 @@ def remember_upload(context: ContextTypes.DEFAULT_TYPE, path: Path, meta: dict, 
             'artist': meta.get('artist', 'Unknown'),
             'title': meta.get('title', path.stem),
             'album': meta.get('album', ''),
+            'genre': meta.get('genre', ''),
             'duration': meta.get('duration', 0),
         },
     }
@@ -275,6 +411,7 @@ def get_upload_record(context: ContextTypes.DEFAULT_TYPE, track_id: str | None =
         'artist': meta.get('artist', 'Unknown'),
         'title': meta.get('title', path.stem),
         'album': meta.get('album', ''),
+        'genre': meta.get('genre', ''),
         'duration': meta.get('duration', upload.get('meta', {}).get('duration', 0)),
     }
     return track_id, {**upload, 'path': path, 'meta': upload['meta']}
@@ -321,6 +458,7 @@ def format_track(path: Path, meta: dict) -> str:
     return (
         f"🎵 {meta.get('artist', 'Unknown')} - {meta.get('title', path.stem)}\n"
         f"💿 {meta.get('album') or '(no album)'}\n"
+        f"🏷 {meta.get('genre') or '(no genre)'}\n"
         f"📁 {path}"
     )
 
@@ -333,6 +471,10 @@ def build_edit_keyboard(track_id: str) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("Album", callback_data=f"edit_field_{track_id}_album"),
+            InlineKeyboardButton("Genre", callback_data=f"edit_field_{track_id}_genre"),
+        ],
+        [
+            InlineKeyboardButton("Cover", callback_data=f"edit_cover_{track_id}"),
             InlineKeyboardButton("Lyrics", callback_data=f"edit_lyrics_{track_id}"),
         ],
         [InlineKeyboardButton("Choose another track", callback_data="edit_list")],
@@ -413,15 +555,88 @@ async def show_recent_uploads(message, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def download_cover_image(update: Update) -> bytes | None:
+    msg = update.message
+    image_file = None
+    suffix = '.jpg'
+
+    if msg.photo:
+        image_file = msg.photo[-1]
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith('image/'):
+        image_file = msg.document
+        suffix = Path(msg.document.file_name or '').suffix or '.img'
+
+    if image_file is None:
+        return None
+
+    tmp_path = Path(tempfile.gettempdir()) / f"navidrome_cover_{secrets.token_hex(8)}{suffix}"
+    try:
+        tg_file = await image_file.get_file()
+        await tg_file.download_to_drive(str(tmp_path))
+        return tmp_path.read_bytes()
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+    track_id = pending.get('track_id')
+    track_id, path, meta = get_upload(context, track_id)
+    if meta is None:
+        context.user_data.pop('edit_pending', None)
+        await update.message.reply_text("⚠️ This upload no longer exists.")
+        return
+
+    image_data = await download_cover_image(update)
+    if not image_data:
+        await update.message.reply_text("⚠️ Send a JPEG or PNG image for the cover.")
+        return
+
+    mime = detect_image_mime(image_data)
+    if mime is None:
+        await update.message.reply_text("⚠️ Cover must be a JPEG or PNG image.")
+        return
+
+    try:
+        write_cover(path, image_data, mime)
+    except Exception as e:
+        logger.error(f"Cover edit failed: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Cover edit failed: {e}")
+        return
+
+    context.user_data.pop('edit_pending', None)
+    scan_ok = trigger_scan()
+    scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
+    if scan_ok:
+        schedule_post_hook(str(path))
+    await update.message.reply_text(
+        f"✅ Cover updated.\n"
+        f"🔄 {scan_status}\n\n"
+        f"{format_track(path, meta)}",
+        reply_markup=build_edit_keyboard(track_id),
+    )
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming audio/document files."""
     user = update.effective_user
     if not is_allowed(user.id):
         await update.message.reply_text("⛔ Not authorized.")
         return
-    context.user_data.pop('edit_pending', None)
 
     msg = update.message
+    pending = context.user_data.get('edit_pending')
+    if pending and pending.get('kind') == 'cover':
+        await handle_cover_upload(update, context, pending)
+        return
+
+    if msg.photo:
+        return
+
+    context.user_data.pop('edit_pending', None)
+
     # Get file object (audio or document)
     if msg.audio:
         file_obj = msg.audio
@@ -468,12 +683,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scan_ok = trigger_scan()
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
     if scan_ok:
-        run_post_hook(str(dest_path))
+        schedule_post_hook(str(dest_path))
 
     await msg.reply_text(
         f"✅ Saved!\n"
         f"🎵 {meta['artist']} - {meta['title']}\n"
         f"💿 {meta['album'] or '(no album)'}\n"
+        f"🏷 {meta.get('genre') or '(no genre)'}\n"
         f"📁 {dest_path}\n"
         f"🔄 {scan_status}"
     )
@@ -527,6 +743,9 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = context.user_data.get('edit_pending')
     if not pending:
         return
+    if pending.get('kind') == 'cover':
+        await update.message.reply_text("⚠️ Send a JPEG or PNG image for the cover, or use /edit to choose again.")
+        return
 
     field = pending.get('field')
     track_id = pending.get('track_id')
@@ -538,7 +757,7 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if field in ('artist', 'title') and not value:
         await update.message.reply_text(f"⚠️ {EDIT_FIELD_LABELS[field]} cannot be empty.")
         return
-    if field == 'album' and value == '-':
+    if field in ('album', 'genre') and value == '-':
         value = ''
 
     track_id, path, meta = get_upload(context, track_id)
@@ -577,7 +796,7 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scan_ok = trigger_scan()
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
     if scan_ok:
-        run_post_hook(str(final_path))
+        schedule_post_hook(str(final_path))
     await update.message.reply_text(
         f"✅ Updated {EDIT_FIELD_LABELS[field]}.\n"
         f"🔄 {scan_status}\n\n"
@@ -631,6 +850,22 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if data.startswith("edit_cover_"):
+        track_id = data.removeprefix("edit_cover_")
+        track_id, path, meta = get_upload(context, track_id)
+        if meta is None:
+            await query.edit_message_text("⚠️ This upload no longer exists.")
+            return
+
+        context.user_data['active_edit_upload_id'] = track_id
+        context.user_data['edit_pending'] = {'kind': 'cover', 'track_id': track_id}
+        await query.edit_message_text(
+            f"🖼 Editing Cover\n\n"
+            f"{format_track(path, meta)}\n\n"
+            f"Send a JPEG or PNG image."
+        )
+        return
+
     if data.startswith("edit_field_"):
         try:
             _prefix, _action, track_id, field = data.split('_', 3)
@@ -647,8 +882,8 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         context.user_data['active_edit_upload_id'] = track_id
-        context.user_data['edit_pending'] = {'field': field, 'track_id': track_id}
-        hint = "Send '-' to clear the album." if field == 'album' else "Send the new value."
+        context.user_data['edit_pending'] = {'kind': 'field', 'field': field, 'track_id': track_id}
+        hint = f"Send '-' to clear the {field}." if field in ('album', 'genre') else "Send the new value."
         await query.edit_message_text(
             f"✏️ Editing {EDIT_FIELD_LABELS[field]}\n\n"
             f"{format_track(path, meta)}\n\n"
@@ -724,7 +959,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         scan_ok = trigger_scan()
         scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
         if scan_ok:
-            run_post_hook(str(path))
+            schedule_post_hook(str(path))
         await query.edit_message_text(
             f"✅ Lyrics replaced! ({source}: {info.get('title','')})\n"
             f"🔄 {scan_status}",
@@ -764,7 +999,14 @@ async def handle_lyrics_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     source, info, lrc = results[idx]
     write_lyrics(path, lrc)
-    await query.edit_message_text(f"✅ Lyrics saved! ({source}: {info.get('title','')})")
+    scan_ok = trigger_scan()
+    scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
+    if scan_ok:
+        schedule_post_hook(str(path))
+    await query.edit_message_text(
+        f"✅ Lyrics saved! ({source}: {info.get('title','')})\n"
+        f"🔄 {scan_status}"
+    )
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -805,7 +1047,7 @@ def main():
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("edit", handle_edit))
-    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.ALL, handle_audio))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.ALL | filters.PHOTO, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_text))
     app.add_handler(CallbackQueryHandler(handle_edit_callback, pattern=r'^edit_'))
     app.add_handler(CallbackQueryHandler(handle_lyrics_callback, pattern=r'^lrc_'))
