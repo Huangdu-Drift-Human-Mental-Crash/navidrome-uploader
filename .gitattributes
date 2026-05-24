@@ -1,0 +1,20 @@
+# Auto-detect text files, normalize to LF in repo
+* text=auto
+
+# Python
+*.py text eol=lf
+
+# Shell scripts — always LF
+*.sh text eol=lf
+
+# Batch files — always CRLF
+*.bat text eol=crlf
+
+# Binary
+*.session binary
+*.session-journal binary
+*.png binary
+*.jpg binary
+*.mp3 binary
+*.flac binary
+*.session binary

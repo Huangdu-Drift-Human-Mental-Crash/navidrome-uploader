@@ -1,0 +1,18 @@
+# Secrets
+.env
+
+# Logs & runtime
+bot.log
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.uv_cache/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,7 @@
+python-telegram-bot==21.6
+mutagen
+requests
+python-dotenv
+cryptography
+pyrogram
+tgcrypto
