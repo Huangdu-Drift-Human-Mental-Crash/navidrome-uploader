@@ -68,6 +68,22 @@ API_HASH=your_api_hash
 
 Without these, files >20MB will be rejected with a prompt.
 
+## Post-processing hook
+
+After each successful upload, the bot can run a custom command. Set `POST_HOOK` in `.env`:
+
+```ini
+POST_HOOK=python /path/to/script.py parms
+```
+
+The `{path}` placeholder is replaced with the saved file path. Examples:
+
+- Regenerate a playlist after upload
+- Trigger external sync scripts
+- Send notifications
+
+The hook runs with a 60-second timeout and won't block the bot on failure.
+
 ## License
 
 MIT

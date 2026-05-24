@@ -15,6 +15,7 @@ from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 import shutil
+import subprocess
 import tempfile
 from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, ContextTypes, filters
@@ -30,6 +31,7 @@ NAVIDROME_URL = os.getenv('NAVIDROME_URL', 'http://localhost:4533')
 NAVIDROME_USER = os.getenv('NAVIDROME_USER', 'admin')
 NAVIDROME_PASS = os.getenv('NAVIDROME_PASS', '')
 MUSIC_FOLDER = Path(os.getenv('MUSIC_FOLDER', './music'))
+POST_HOOK = os.getenv('POST_HOOK', '').strip()
 API_ID = os.getenv('API_ID', '').strip()
 API_HASH = os.getenv('API_HASH', '').strip()
 
@@ -78,6 +80,17 @@ MAX_LYRICS_SETS_PER_UPLOAD = 5
 
 def is_allowed(user_id: int) -> bool:
     return not ALLOWED_USERS or user_id in ALLOWED_USERS
+
+
+def run_post_hook(filepath: str):
+    """Run user-defined post-processing command. {path} is replaced with the file path."""
+    if not POST_HOOK:
+        return
+    try:
+        cmd = POST_HOOK.replace('{path}', filepath)
+        subprocess.run(cmd, shell=True, timeout=60, capture_output=True)
+    except Exception as e:
+        logger.warning(f"Post-hook failed: {e}")
 
 
 def trigger_scan():
@@ -454,6 +467,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Trigger scan
     scan_ok = trigger_scan()
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
+    if scan_ok:
+        run_post_hook(str(dest_path))
 
     await msg.reply_text(
         f"✅ Saved!\n"
@@ -561,6 +576,8 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     scan_ok = trigger_scan()
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
+    if scan_ok:
+        run_post_hook(str(final_path))
     await update.message.reply_text(
         f"✅ Updated {EDIT_FIELD_LABELS[field]}.\n"
         f"🔄 {scan_status}\n\n"
@@ -706,6 +723,8 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         write_lyrics(path, lrc)
         scan_ok = trigger_scan()
         scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
+        if scan_ok:
+            run_post_hook(str(path))
         await query.edit_message_text(
             f"✅ Lyrics replaced! ({source}: {info.get('title','')})\n"
             f"🔄 {scan_status}",
