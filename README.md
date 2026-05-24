@@ -54,6 +54,8 @@ Files are stored as `{MUSIC_FOLDER}/{Artist}/{Title}.ext` (flat, no album subdir
 
 Send `/edit` after uploading to choose from recent tracks and open an inline edit menu. You can change artist, title, album, genre, or cover; artist/title changes also move the file to the matching `{Artist}/{Title}.ext` path. Choose `Cover` and send a JPEG or PNG image to embed it as the front cover. Choose `Lyrics` to search QQ Music / Kugou / Netease again and replace the embedded lyrics with one of the new results.
 
+Use `/edit song name` to search the whole `MUSIC_FOLDER` by filename, path, and metadata tags, then choose a matching track to edit.
+
 ## Large file support (Pyrogram)
 
 Telegram Bot API limits single file downloads to 20MB. With Pyrogram (MTProto protocol) you can download up to 2GB.

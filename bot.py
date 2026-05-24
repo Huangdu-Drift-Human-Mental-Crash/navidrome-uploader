@@ -78,8 +78,10 @@ EDIT_FIELD_LABELS = {
 }
 MAX_RECENT_UPLOADS = 50
 MAX_EDIT_UPLOAD_CHOICES = 10
+MAX_LIBRARY_SEARCH_RESULTS = 10
 MAX_LYRICS_SETS_PER_UPLOAD = 5
 POST_HOOK_TIMEOUT = 60
+SUPPORTED_AUDIO_EXTS = ('.mp3', '.flac', '.m4a', '.ogg', '.wav', '.aac', '.wma', '.opus')
 
 
 def is_allowed(user_id: int) -> bool:
@@ -363,7 +365,13 @@ def trim_recent_uploads(context: ContextTypes.DEFAULT_TYPE):
         uploads.pop(old_track_id, None)
 
 
-def remember_upload(context: ContextTypes.DEFAULT_TYPE, path: Path, meta: dict, track_id: str | None = None) -> str:
+def remember_upload(
+    context: ContextTypes.DEFAULT_TYPE,
+    path: Path,
+    meta: dict,
+    track_id: str | None = None,
+    add_to_recent: bool = True,
+) -> str:
     uploads = context.user_data.setdefault('uploads', {})
     order = context.user_data.setdefault('upload_order', [])
     track_id = track_id or make_track_id(context)
@@ -379,11 +387,12 @@ def remember_upload(context: ContextTypes.DEFAULT_TYPE, path: Path, meta: dict, 
             'duration': meta.get('duration', 0),
         },
     }
-    if track_id in order:
-        order.remove(track_id)
-    order.append(track_id)
-    context.user_data['last_upload_id'] = track_id
-    trim_recent_uploads(context)
+    if add_to_recent:
+        if track_id in order:
+            order.remove(track_id)
+        order.append(track_id)
+        context.user_data['last_upload_id'] = track_id
+        trim_recent_uploads(context)
     return track_id
 
 
@@ -482,13 +491,101 @@ def build_edit_keyboard(track_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def build_recent_uploads_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+def build_upload_choices_keyboard(uploads: list) -> InlineKeyboardMarkup:
     buttons = []
-    for track_id, _path, meta in recent_uploads(context, MAX_EDIT_UPLOAD_CHOICES):
+    for track_id, _path, meta in uploads:
         label = f"{meta.get('artist', 'Unknown')} - {meta.get('title', 'Unknown')}"
         buttons.append([InlineKeyboardButton(label[:60], callback_data=f"edit_pick_{track_id}")])
     buttons.append([InlineKeyboardButton("Done", callback_data="edit_done")])
     return InlineKeyboardMarkup(buttons)
+
+
+def build_recent_uploads_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    return build_upload_choices_keyboard(recent_uploads(context, MAX_EDIT_UPLOAD_CHOICES))
+
+
+def normalize_search_text(text: str) -> str:
+    return re.sub(r'\s+', ' ', text.casefold()).strip()
+
+
+def score_library_match(query: str, path: Path, meta: dict) -> int:
+    query = normalize_search_text(query)
+    title = normalize_search_text(meta.get('title', ''))
+    artist = normalize_search_text(meta.get('artist', ''))
+    album = normalize_search_text(meta.get('album', ''))
+    genre = normalize_search_text(meta.get('genre', ''))
+    stem = normalize_search_text(path.stem)
+    try:
+        relative_path = normalize_search_text(str(path.relative_to(MUSIC_FOLDER)))
+    except ValueError:
+        relative_path = normalize_search_text(str(path))
+    combined = normalize_search_text(' '.join([artist, title, album, genre, stem, relative_path]))
+
+    if not query:
+        return 0
+    if query == title:
+        return 1000
+    if query == stem:
+        return 900
+    if query == f"{artist} {title}".strip() or query == f"{artist} - {title}".strip():
+        return 850
+    if query in title:
+        return 800
+    if query in stem:
+        return 700
+    if query in f"{artist} {title}".strip():
+        return 650
+    if query in relative_path:
+        return 500
+
+    tokens = [token for token in query.split(' ') if token]
+    if tokens and all(token in combined for token in tokens):
+        return 300 + sum(1 for token in tokens if token in title) * 20
+    return 0
+
+
+def search_library(query: str, limit: int = MAX_LIBRARY_SEARCH_RESULTS) -> list:
+    matches = []
+    if not query or not MUSIC_FOLDER.exists():
+        return matches
+
+    for path in MUSIC_FOLDER.rglob('*'):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
+            continue
+        try:
+            meta = get_metadata(path)
+        except Exception as e:
+            logger.debug(f"Library search skipped {path}: {e}")
+            continue
+        if not meta:
+            continue
+        score = score_library_match(query, path, meta)
+        if score:
+            matches.append((score, path, meta))
+
+    matches.sort(key=lambda item: (-item[0], str(item[1]).casefold()))
+    return [(path, meta) for _score, path, meta in matches[:limit]]
+
+
+def clear_library_search_uploads(context: ContextTypes.DEFAULT_TYPE):
+    uploads = context.user_data.setdefault('uploads', {})
+    order = set(context.user_data.setdefault('upload_order', []))
+    for track_id in context.user_data.get('library_search_upload_ids', []):
+        if track_id not in order and track_id != context.user_data.get('active_edit_upload_id'):
+            uploads.pop(track_id, None)
+    context.user_data['library_search_upload_ids'] = []
+
+
+def remember_library_search_results(context: ContextTypes.DEFAULT_TYPE, matches: list) -> list:
+    clear_library_search_uploads(context)
+    choices = []
+    search_ids = []
+    for path, meta in matches:
+        track_id = remember_upload(context, path, meta, add_to_recent=False)
+        choices.append((track_id, path, meta))
+        search_ids.append(track_id)
+    context.user_data['library_search_upload_ids'] = search_ids
+    return choices
 
 
 def find_synced_lyrics(meta: dict) -> list:
@@ -551,7 +648,30 @@ async def show_recent_uploads(message, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {meta.get('artist', 'Unknown')} - {meta.get('title', 'Unknown')}")
     await message.reply_text(
         '\n'.join(lines),
-        reply_markup=build_recent_uploads_keyboard(context),
+        reply_markup=build_upload_choices_keyboard(uploads),
+    )
+
+
+async def show_library_search(message, context: ContextTypes.DEFAULT_TYPE, query: str):
+    await message.reply_text(f"🔎 Searching library for: {query}")
+    matches = await asyncio.to_thread(search_library, query)
+    if not matches:
+        await message.reply_text(f"⚠️ No tracks found for: {query}")
+        return
+
+    choices = remember_library_search_results(context, matches)
+    if len(choices) == 1:
+        track_id, path, meta = choices[0]
+        remember_upload(context, path, meta, track_id)
+        await show_edit_menu(message, context, track_id, prefix=f"✏️ Editing library match for: {query}")
+        return
+
+    lines = [f"✏️ Choose a library match for: {query}\n"]
+    for i, (_track_id, _path, meta) in enumerate(choices, 1):
+        lines.append(f"{i}. {meta.get('artist', 'Unknown')} - {meta.get('title', 'Unknown')}")
+    await message.reply_text(
+        '\n'.join(lines),
+        reply_markup=build_upload_choices_keyboard(choices),
     )
 
 
@@ -644,7 +764,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif msg.document:
         file_name = msg.document.file_name or 'unknown'
         ext = Path(file_name).suffix.lower()
-        if ext not in ('.mp3', '.flac', '.m4a', '.ogg', '.wav', '.aac', '.wma', '.opus'):
+        if ext not in SUPPORTED_AUDIO_EXTS:
             await update.message.reply_text("⚠️ Not a supported audio format.")
             return
         file_obj = msg.document
@@ -730,6 +850,11 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data.pop('edit_pending', None)
+    query = ' '.join(context.args).strip()
+    if query:
+        await show_library_search(update.message, context, query)
+        return
+
     await show_recent_uploads(update.message, context)
 
 
@@ -843,6 +968,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if meta is None:
             await query.edit_message_text("⚠️ This upload no longer exists.")
             return
+        remember_upload(context, path, meta, track_id)
         context.user_data['active_edit_upload_id'] = track_id
         await query.edit_message_text(
             f"✏️ Editing upload\n\n{format_track(path, meta)}",
