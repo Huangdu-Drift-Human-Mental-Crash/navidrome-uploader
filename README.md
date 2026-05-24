@@ -8,6 +8,7 @@ Upload audio files to [Navidrome](https://www.navidrome.org/) via Telegram, with
 - Extracts ID3 / Vorbis / MP4 tags, organizes as `{Artist}/{Title}`
 - Triggers Navidrome library scan via Subsonic API
 - Searches QQ Music / Kugou / Netease for synced lyrics and embeds them
+- `/edit` interactively edits recent uploads' artist/title/album and can replace lyrics
 
 ## Requirements
 
@@ -48,6 +49,10 @@ python bot.py                         # Linux/macOS
 ## Directory structure
 
 Files are stored as `{MUSIC_FOLDER}/{Artist}/{Title}.ext` (flat, no album subdirectories).
+
+## Editing recent uploads
+
+Send `/edit` after uploading to choose from recent tracks and open an inline edit menu. You can change artist, title, or album; artist/title changes also move the file to the matching `{Artist}/{Title}.ext` path. Choose `Lyrics` to search QQ Music / Kugou / Netease again and replace the embedded lyrics with one of the new results.
 
 ## Large file support (Pyrogram)
 
