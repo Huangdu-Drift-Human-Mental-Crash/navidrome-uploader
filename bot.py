@@ -8,7 +8,10 @@ import re
 import shlex
 import logging
 import secrets
+import unicodedata
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests as http_requests
 from dotenv import load_dotenv
@@ -43,7 +46,6 @@ if API_ID and API_HASH:
     from pyrogram import Client as PyroClient
     proxy_cfg = None
     if PROXY_URL:
-        from urllib.parse import urlparse
         p = urlparse(PROXY_URL)
         proxy_cfg = {'scheme': p.scheme, 'hostname': p.hostname, 'port': p.port}
     pyro_client = PyroClient(
@@ -81,7 +83,13 @@ MAX_EDIT_UPLOAD_CHOICES = 10
 MAX_LIBRARY_SEARCH_RESULTS = 10
 MAX_LYRICS_SETS_PER_UPLOAD = 5
 POST_HOOK_TIMEOUT = 60
+COVER_IMAGE_MAX_BYTES = 15 * 1024 * 1024
+COVER_PAGE_MAX_BYTES = 2 * 1024 * 1024
 SUPPORTED_AUDIO_EXTS = ('.mp3', '.flac', '.m4a', '.ogg', '.wav', '.aac', '.wma', '.opus')
+COVER_FETCH_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (compatible; NavidromeUploaderBot/1.0)',
+    'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+}
 
 
 def is_allowed(user_id: int) -> bool:
@@ -349,6 +357,214 @@ def write_cover(filepath: Path, image_data: bytes, mime: str):
     raise ValueError(f"Cover editing is not supported for {ext or 'this file type'}.")
 
 
+class CoverImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls = []
+
+    def handle_starttag(self, tag: str, attrs: list):
+        attrs = {key.lower(): value for key, value in attrs if key and value}
+        if tag == 'meta':
+            key = (attrs.get('property') or attrs.get('name') or attrs.get('itemprop') or '').lower()
+            if key in ('og:image', 'og:image:url', 'twitter:image', 'twitter:image:src',
+                       'thumbnail', 'thumbnailurl'):
+                self.urls.append(attrs.get('content', ''))
+        elif tag == 'link':
+            rel = attrs.get('rel', '').lower()
+            if 'image_src' in rel or 'thumbnail' in rel:
+                self.urls.append(attrs.get('href', ''))
+
+
+def extract_first_url(text: str) -> str | None:
+    match = re.search(r'https?://\S+', text.strip())
+    if not match:
+        return None
+    return match.group(0).rstrip('.,，。)')
+
+
+def validate_http_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        raise ValueError("Only http(s) URLs are supported.")
+    return url
+
+
+def cover_fetch_headers(url: str, accept: str | None = None) -> dict:
+    headers = dict(COVER_FETCH_HEADERS)
+    if accept:
+        headers['Accept'] = accept
+    host = urlparse(url).netloc.casefold()
+    if 'bilibili.com' in host or 'hdslb.com' in host:
+        headers['Referer'] = 'https://www.bilibili.com/'
+    return headers
+
+
+def parse_youtube_video_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.casefold().split(':')[0]
+    path_parts = [part for part in parsed.path.split('/') if part]
+
+    if host.endswith('youtu.be') and path_parts:
+        return path_parts[0]
+    if 'youtube.com' not in host:
+        return None
+
+    query_id = parse_qs(parsed.query).get('v', [''])[0]
+    if query_id:
+        return query_id
+    if len(path_parts) >= 2 and path_parts[0] in ('shorts', 'embed', 'v'):
+        return path_parts[1]
+    return None
+
+
+def youtube_cover_candidates(url: str) -> list[str]:
+    video_id = parse_youtube_video_id(url)
+    if not video_id:
+        return []
+    return [
+        f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://img.youtube.com/vi/{video_id}/sddefault.jpg",
+        f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+    ]
+
+
+def parse_bilibili_video_id(url: str) -> tuple[str | None, str | None]:
+    parsed = urlparse(url)
+    host = parsed.netloc.casefold().split(':')[0]
+    if 'bilibili.com' not in host and 'b23.tv' not in host:
+        return None, None
+
+    match = re.search(r'/video/(BV[0-9A-Za-z]+)', parsed.path)
+    if match:
+        return match.group(1), None
+
+    match = re.search(r'/video/av(\d+)', parsed.path, re.IGNORECASE)
+    if match:
+        return None, match.group(1)
+
+    query = parse_qs(parsed.query)
+    bvid = (query.get('bvid') or [''])[0]
+    aid = (query.get('aid') or [''])[0]
+    return bvid or None, aid or None
+
+
+def bilibili_cover_candidates(url: str) -> list[str]:
+    bvid, aid = parse_bilibili_video_id(url)
+    if not bvid and not aid:
+        return []
+
+    params = {'bvid': bvid} if bvid else {'aid': aid}
+    try:
+        response = http_requests.get(
+            'https://api.bilibili.com/x/web-interface/view',
+            params=params,
+            headers=cover_fetch_headers(url, 'application/json,*/*;q=0.8'),
+            timeout=15,
+        )
+        if response.status_code >= 400:
+            return []
+        data = response.json()
+    except Exception as e:
+        logger.debug(f"Bilibili cover API failed for {url}: {e}")
+        return []
+
+    pic = data.get('data', {}).get('pic') if isinstance(data, dict) else ''
+    if not pic:
+        return []
+    return [urljoin('https://www.bilibili.com/', pic)]
+
+
+def read_limited_response(response, limit: int) -> bytes:
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("Remote content is too large.")
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
+def try_fetch_image_url(url: str) -> bytes | None:
+    validate_http_url(url)
+    try:
+        response = http_requests.get(
+            url,
+            headers=cover_fetch_headers(url),
+            timeout=15,
+            stream=True,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            return None
+        content_type = response.headers.get('Content-Type', '').lower()
+        if content_type and not content_type.startswith('image/'):
+            return None
+        content_length = response.headers.get('Content-Length')
+        if content_length and content_length.isdigit() and int(content_length) > COVER_IMAGE_MAX_BYTES:
+            raise ValueError("Remote image is too large.")
+        image_data = read_limited_response(response, COVER_IMAGE_MAX_BYTES)
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.debug(f"Image URL fetch failed for {url}: {e}")
+        return None
+
+    if detect_image_mime(image_data):
+        return image_data
+    return None
+
+
+def fetch_page_cover_url(url: str) -> str | None:
+    validate_http_url(url)
+    response = http_requests.get(
+        url,
+        headers=cover_fetch_headers(url, 'text/html,*/*;q=0.8'),
+        timeout=15,
+        stream=True,
+        allow_redirects=True,
+    )
+    if response.status_code >= 400:
+        return None
+
+    content = read_limited_response(response, COVER_PAGE_MAX_BYTES)
+    html = content.decode(response.encoding or 'utf-8', errors='replace')
+    parser = CoverImageParser()
+    parser.feed(html)
+    for candidate in parser.urls:
+        if candidate:
+            return urljoin(response.url, candidate)
+    return None
+
+
+def fetch_cover_from_url(url: str) -> bytes:
+    url = validate_http_url(url)
+
+    image_data = try_fetch_image_url(url)
+    if image_data:
+        return image_data
+
+    for candidate in youtube_cover_candidates(url):
+        image_data = try_fetch_image_url(candidate)
+        if image_data:
+            return image_data
+
+    for candidate in bilibili_cover_candidates(url):
+        image_data = try_fetch_image_url(candidate)
+        if image_data:
+            return image_data
+
+    cover_url = fetch_page_cover_url(url)
+    if cover_url:
+        image_data = try_fetch_image_url(cover_url)
+        if image_data:
+            return image_data
+
+    raise ValueError("Could not find a JPEG or PNG cover image at that URL.")
+
+
 def make_track_id(context: ContextTypes.DEFAULT_TYPE) -> str:
     uploads = context.user_data.setdefault('uploads', {})
     while True:
@@ -505,7 +721,12 @@ def build_recent_uploads_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineK
 
 
 def normalize_search_text(text: str) -> str:
+    text = unicodedata.normalize('NFKC', str(text))
     return re.sub(r'\s+', ' ', text.casefold()).strip()
+
+
+def compact_search_text(text: str) -> str:
+    return re.sub(r'\s+', '', normalize_search_text(text))
 
 
 def score_library_match(query: str, path: Path, meta: dict) -> int:
@@ -520,6 +741,11 @@ def score_library_match(query: str, path: Path, meta: dict) -> int:
     except ValueError:
         relative_path = normalize_search_text(str(path))
     combined = normalize_search_text(' '.join([artist, title, album, genre, stem, relative_path]))
+    compact_query = compact_search_text(query)
+    compact_title = compact_search_text(title)
+    compact_stem = compact_search_text(stem)
+    compact_artist_title = compact_search_text(f"{artist} {title}")
+    compact_relative_path = compact_search_text(relative_path)
 
     if not query:
         return 0
@@ -537,6 +763,14 @@ def score_library_match(query: str, path: Path, meta: dict) -> int:
         return 650
     if query in relative_path:
         return 500
+    if compact_query and compact_query == compact_title:
+        return 780
+    if compact_query and compact_query == compact_stem:
+        return 680
+    if compact_query and compact_query in compact_artist_title:
+        return 620
+    if compact_query and compact_query in compact_relative_path:
+        return 480
 
     tokens = [token for token in query.split(' ') if token]
     if tokens and all(token in combined for token in tokens):
@@ -701,7 +935,7 @@ async def download_cover_image(update: Update) -> bytes | None:
             pass
 
 
-async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+async def apply_cover_data(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict, image_data: bytes):
     track_id = pending.get('track_id')
     track_id, path, meta = get_upload(context, track_id)
     if meta is None:
@@ -709,9 +943,8 @@ async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ This upload no longer exists.")
         return
 
-    image_data = await download_cover_image(update)
-    if not image_data:
-        await update.message.reply_text("⚠️ Send a JPEG or PNG image for the cover.")
+    if len(image_data) > COVER_IMAGE_MAX_BYTES:
+        await update.message.reply_text("⚠️ Cover image is too large.")
         return
 
     mime = detect_image_mime(image_data)
@@ -737,6 +970,31 @@ async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"{format_track(path, meta)}",
         reply_markup=build_edit_keyboard(track_id),
     )
+
+
+async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+    image_data = await download_cover_image(update)
+    if not image_data:
+        await update.message.reply_text("⚠️ Send a JPEG/PNG image or a supported URL for the cover.")
+        return
+    await apply_cover_data(update, context, pending, image_data)
+
+
+async def handle_cover_text(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+    url = extract_first_url(update.message.text or '')
+    if not url:
+        await update.message.reply_text("⚠️ Send a JPEG/PNG image, image URL, or YouTube/niconico/bilibili URL.")
+        return
+
+    await update.message.reply_text("🔎 Fetching cover image from URL...")
+    try:
+        image_data = await asyncio.to_thread(fetch_cover_from_url, url)
+    except Exception as e:
+        logger.warning(f"Cover URL fetch failed: {e}")
+        await update.message.reply_text(f"❌ Could not fetch cover: {e}")
+        return
+
+    await apply_cover_data(update, context, pending, image_data)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -869,7 +1127,7 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending:
         return
     if pending.get('kind') == 'cover':
-        await update.message.reply_text("⚠️ Send a JPEG or PNG image for the cover, or use /edit to choose again.")
+        await handle_cover_text(update, context, pending)
         return
 
     field = pending.get('field')
@@ -988,7 +1246,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             f"🖼 Editing Cover\n\n"
             f"{format_track(path, meta)}\n\n"
-            f"Send a JPEG or PNG image."
+            f"Send a JPEG/PNG image, image URL, or YouTube/niconico/bilibili URL."
         )
         return
 
