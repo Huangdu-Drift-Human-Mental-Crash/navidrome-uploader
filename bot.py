@@ -8,7 +8,10 @@ import re
 import shlex
 import logging
 import secrets
+import unicodedata
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests as http_requests
 from dotenv import load_dotenv
@@ -43,7 +46,6 @@ if API_ID and API_HASH:
     from pyrogram import Client as PyroClient
     proxy_cfg = None
     if PROXY_URL:
-        from urllib.parse import urlparse
         p = urlparse(PROXY_URL)
         proxy_cfg = {'scheme': p.scheme, 'hostname': p.hostname, 'port': p.port}
     pyro_client = PyroClient(
@@ -78,8 +80,16 @@ EDIT_FIELD_LABELS = {
 }
 MAX_RECENT_UPLOADS = 50
 MAX_EDIT_UPLOAD_CHOICES = 10
+MAX_LIBRARY_SEARCH_RESULTS = 10
 MAX_LYRICS_SETS_PER_UPLOAD = 5
 POST_HOOK_TIMEOUT = 60
+COVER_IMAGE_MAX_BYTES = 15 * 1024 * 1024
+COVER_PAGE_MAX_BYTES = 2 * 1024 * 1024
+SUPPORTED_AUDIO_EXTS = ('.mp3', '.flac', '.m4a', '.ogg', '.wav', '.aac', '.wma', '.opus')
+COVER_FETCH_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (compatible; NavidromeUploaderBot/1.0)',
+    'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+}
 
 
 def is_allowed(user_id: int) -> bool:
@@ -347,6 +357,214 @@ def write_cover(filepath: Path, image_data: bytes, mime: str):
     raise ValueError(f"Cover editing is not supported for {ext or 'this file type'}.")
 
 
+class CoverImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls = []
+
+    def handle_starttag(self, tag: str, attrs: list):
+        attrs = {key.lower(): value for key, value in attrs if key and value}
+        if tag == 'meta':
+            key = (attrs.get('property') or attrs.get('name') or attrs.get('itemprop') or '').lower()
+            if key in ('og:image', 'og:image:url', 'twitter:image', 'twitter:image:src',
+                       'thumbnail', 'thumbnailurl'):
+                self.urls.append(attrs.get('content', ''))
+        elif tag == 'link':
+            rel = attrs.get('rel', '').lower()
+            if 'image_src' in rel or 'thumbnail' in rel:
+                self.urls.append(attrs.get('href', ''))
+
+
+def extract_first_url(text: str) -> str | None:
+    match = re.search(r'https?://\S+', text.strip())
+    if not match:
+        return None
+    return match.group(0).rstrip('.,，。)')
+
+
+def validate_http_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        raise ValueError("Only http(s) URLs are supported.")
+    return url
+
+
+def cover_fetch_headers(url: str, accept: str | None = None) -> dict:
+    headers = dict(COVER_FETCH_HEADERS)
+    if accept:
+        headers['Accept'] = accept
+    host = urlparse(url).netloc.casefold()
+    if 'bilibili.com' in host or 'hdslb.com' in host:
+        headers['Referer'] = 'https://www.bilibili.com/'
+    return headers
+
+
+def parse_youtube_video_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.casefold().split(':')[0]
+    path_parts = [part for part in parsed.path.split('/') if part]
+
+    if host.endswith('youtu.be') and path_parts:
+        return path_parts[0]
+    if 'youtube.com' not in host:
+        return None
+
+    query_id = parse_qs(parsed.query).get('v', [''])[0]
+    if query_id:
+        return query_id
+    if len(path_parts) >= 2 and path_parts[0] in ('shorts', 'embed', 'v'):
+        return path_parts[1]
+    return None
+
+
+def youtube_cover_candidates(url: str) -> list[str]:
+    video_id = parse_youtube_video_id(url)
+    if not video_id:
+        return []
+    return [
+        f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://img.youtube.com/vi/{video_id}/sddefault.jpg",
+        f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+    ]
+
+
+def parse_bilibili_video_id(url: str) -> tuple[str | None, str | None]:
+    parsed = urlparse(url)
+    host = parsed.netloc.casefold().split(':')[0]
+    if 'bilibili.com' not in host and 'b23.tv' not in host:
+        return None, None
+
+    match = re.search(r'/video/(BV[0-9A-Za-z]+)', parsed.path)
+    if match:
+        return match.group(1), None
+
+    match = re.search(r'/video/av(\d+)', parsed.path, re.IGNORECASE)
+    if match:
+        return None, match.group(1)
+
+    query = parse_qs(parsed.query)
+    bvid = (query.get('bvid') or [''])[0]
+    aid = (query.get('aid') or [''])[0]
+    return bvid or None, aid or None
+
+
+def bilibili_cover_candidates(url: str) -> list[str]:
+    bvid, aid = parse_bilibili_video_id(url)
+    if not bvid and not aid:
+        return []
+
+    params = {'bvid': bvid} if bvid else {'aid': aid}
+    try:
+        response = http_requests.get(
+            'https://api.bilibili.com/x/web-interface/view',
+            params=params,
+            headers=cover_fetch_headers(url, 'application/json,*/*;q=0.8'),
+            timeout=15,
+        )
+        if response.status_code >= 400:
+            return []
+        data = response.json()
+    except Exception as e:
+        logger.debug(f"Bilibili cover API failed for {url}: {e}")
+        return []
+
+    pic = data.get('data', {}).get('pic') if isinstance(data, dict) else ''
+    if not pic:
+        return []
+    return [urljoin('https://www.bilibili.com/', pic)]
+
+
+def read_limited_response(response, limit: int) -> bytes:
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("Remote content is too large.")
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
+def try_fetch_image_url(url: str) -> bytes | None:
+    validate_http_url(url)
+    try:
+        response = http_requests.get(
+            url,
+            headers=cover_fetch_headers(url),
+            timeout=15,
+            stream=True,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            return None
+        content_type = response.headers.get('Content-Type', '').lower()
+        if content_type and not content_type.startswith('image/'):
+            return None
+        content_length = response.headers.get('Content-Length')
+        if content_length and content_length.isdigit() and int(content_length) > COVER_IMAGE_MAX_BYTES:
+            raise ValueError("Remote image is too large.")
+        image_data = read_limited_response(response, COVER_IMAGE_MAX_BYTES)
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.debug(f"Image URL fetch failed for {url}: {e}")
+        return None
+
+    if detect_image_mime(image_data):
+        return image_data
+    return None
+
+
+def fetch_page_cover_url(url: str) -> str | None:
+    validate_http_url(url)
+    response = http_requests.get(
+        url,
+        headers=cover_fetch_headers(url, 'text/html,*/*;q=0.8'),
+        timeout=15,
+        stream=True,
+        allow_redirects=True,
+    )
+    if response.status_code >= 400:
+        return None
+
+    content = read_limited_response(response, COVER_PAGE_MAX_BYTES)
+    html = content.decode(response.encoding or 'utf-8', errors='replace')
+    parser = CoverImageParser()
+    parser.feed(html)
+    for candidate in parser.urls:
+        if candidate:
+            return urljoin(response.url, candidate)
+    return None
+
+
+def fetch_cover_from_url(url: str) -> bytes:
+    url = validate_http_url(url)
+
+    image_data = try_fetch_image_url(url)
+    if image_data:
+        return image_data
+
+    for candidate in youtube_cover_candidates(url):
+        image_data = try_fetch_image_url(candidate)
+        if image_data:
+            return image_data
+
+    for candidate in bilibili_cover_candidates(url):
+        image_data = try_fetch_image_url(candidate)
+        if image_data:
+            return image_data
+
+    cover_url = fetch_page_cover_url(url)
+    if cover_url:
+        image_data = try_fetch_image_url(cover_url)
+        if image_data:
+            return image_data
+
+    raise ValueError("Could not find a JPEG or PNG cover image at that URL.")
+
+
 def make_track_id(context: ContextTypes.DEFAULT_TYPE) -> str:
     uploads = context.user_data.setdefault('uploads', {})
     while True:
@@ -363,7 +581,13 @@ def trim_recent_uploads(context: ContextTypes.DEFAULT_TYPE):
         uploads.pop(old_track_id, None)
 
 
-def remember_upload(context: ContextTypes.DEFAULT_TYPE, path: Path, meta: dict, track_id: str | None = None) -> str:
+def remember_upload(
+    context: ContextTypes.DEFAULT_TYPE,
+    path: Path,
+    meta: dict,
+    track_id: str | None = None,
+    add_to_recent: bool = True,
+) -> str:
     uploads = context.user_data.setdefault('uploads', {})
     order = context.user_data.setdefault('upload_order', [])
     track_id = track_id or make_track_id(context)
@@ -379,11 +603,12 @@ def remember_upload(context: ContextTypes.DEFAULT_TYPE, path: Path, meta: dict, 
             'duration': meta.get('duration', 0),
         },
     }
-    if track_id in order:
-        order.remove(track_id)
-    order.append(track_id)
-    context.user_data['last_upload_id'] = track_id
-    trim_recent_uploads(context)
+    if add_to_recent:
+        if track_id in order:
+            order.remove(track_id)
+        order.append(track_id)
+        context.user_data['last_upload_id'] = track_id
+        trim_recent_uploads(context)
     return track_id
 
 
@@ -482,13 +707,119 @@ def build_edit_keyboard(track_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def build_recent_uploads_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+def build_upload_choices_keyboard(uploads: list) -> InlineKeyboardMarkup:
     buttons = []
-    for track_id, _path, meta in recent_uploads(context, MAX_EDIT_UPLOAD_CHOICES):
+    for track_id, _path, meta in uploads:
         label = f"{meta.get('artist', 'Unknown')} - {meta.get('title', 'Unknown')}"
         buttons.append([InlineKeyboardButton(label[:60], callback_data=f"edit_pick_{track_id}")])
     buttons.append([InlineKeyboardButton("Done", callback_data="edit_done")])
     return InlineKeyboardMarkup(buttons)
+
+
+def build_recent_uploads_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    return build_upload_choices_keyboard(recent_uploads(context, MAX_EDIT_UPLOAD_CHOICES))
+
+
+def normalize_search_text(text: str) -> str:
+    text = unicodedata.normalize('NFKC', str(text))
+    return re.sub(r'\s+', ' ', text.casefold()).strip()
+
+
+def compact_search_text(text: str) -> str:
+    return re.sub(r'\s+', '', normalize_search_text(text))
+
+
+def score_library_match(query: str, path: Path, meta: dict) -> int:
+    query = normalize_search_text(query)
+    title = normalize_search_text(meta.get('title', ''))
+    artist = normalize_search_text(meta.get('artist', ''))
+    album = normalize_search_text(meta.get('album', ''))
+    genre = normalize_search_text(meta.get('genre', ''))
+    stem = normalize_search_text(path.stem)
+    try:
+        relative_path = normalize_search_text(str(path.relative_to(MUSIC_FOLDER)))
+    except ValueError:
+        relative_path = normalize_search_text(str(path))
+    combined = normalize_search_text(' '.join([artist, title, album, genre, stem, relative_path]))
+    compact_query = compact_search_text(query)
+    compact_title = compact_search_text(title)
+    compact_stem = compact_search_text(stem)
+    compact_artist_title = compact_search_text(f"{artist} {title}")
+    compact_relative_path = compact_search_text(relative_path)
+
+    if not query:
+        return 0
+    if query == title:
+        return 1000
+    if query == stem:
+        return 900
+    if query == f"{artist} {title}".strip() or query == f"{artist} - {title}".strip():
+        return 850
+    if query in title:
+        return 800
+    if query in stem:
+        return 700
+    if query in f"{artist} {title}".strip():
+        return 650
+    if query in relative_path:
+        return 500
+    if compact_query and compact_query == compact_title:
+        return 780
+    if compact_query and compact_query == compact_stem:
+        return 680
+    if compact_query and compact_query in compact_artist_title:
+        return 620
+    if compact_query and compact_query in compact_relative_path:
+        return 480
+
+    tokens = [token for token in query.split(' ') if token]
+    if tokens and all(token in combined for token in tokens):
+        return 300 + sum(1 for token in tokens if token in title) * 20
+    return 0
+
+
+def search_library(query: str, limit: int = MAX_LIBRARY_SEARCH_RESULTS) -> list:
+    matches = []
+    if not query or not MUSIC_FOLDER.exists():
+        return matches
+
+    for path in MUSIC_FOLDER.rglob('*'):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
+            continue
+        try:
+            meta = get_metadata(path)
+        except Exception as e:
+            logger.debug(f"Library search skipped {path}: {e}")
+            continue
+        if not meta:
+            continue
+        score = score_library_match(query, path, meta)
+        if score:
+            matches.append((score, path, meta))
+
+    matches.sort(key=lambda item: (-item[0], str(item[1]).casefold()))
+    return [(path, meta) for _score, path, meta in matches[:limit]]
+
+
+def clear_library_search_uploads(context: ContextTypes.DEFAULT_TYPE):
+    uploads = context.user_data.setdefault('uploads', {})
+    order = set(context.user_data.setdefault('upload_order', []))
+    for track_id in context.user_data.get('library_search_upload_ids', []):
+        if track_id not in order and track_id != context.user_data.get('active_edit_upload_id'):
+            uploads.pop(track_id, None)
+    context.user_data['library_search_upload_ids'] = []
+
+
+def remember_library_search_results(context: ContextTypes.DEFAULT_TYPE, matches: list) -> list:
+    clear_library_search_uploads(context)
+    choices = []
+    search_ids = []
+    for path, meta in matches:
+        track_id = remember_upload(context, path, meta, add_to_recent=False)
+        choices.append((track_id, path, meta))
+        search_ids.append(track_id)
+    context.user_data['library_search_upload_ids'] = search_ids
+    return choices
 
 
 def find_synced_lyrics(meta: dict) -> list:
@@ -551,7 +882,30 @@ async def show_recent_uploads(message, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {meta.get('artist', 'Unknown')} - {meta.get('title', 'Unknown')}")
     await message.reply_text(
         '\n'.join(lines),
-        reply_markup=build_recent_uploads_keyboard(context),
+        reply_markup=build_upload_choices_keyboard(uploads),
+    )
+
+
+async def show_library_search(message, context: ContextTypes.DEFAULT_TYPE, query: str):
+    await message.reply_text(f"🔎 Searching library for: {query}")
+    matches = await asyncio.to_thread(search_library, query)
+    if not matches:
+        await message.reply_text(f"⚠️ No tracks found for: {query}")
+        return
+
+    choices = remember_library_search_results(context, matches)
+    if len(choices) == 1:
+        track_id, path, meta = choices[0]
+        remember_upload(context, path, meta, track_id)
+        await show_edit_menu(message, context, track_id, prefix=f"✏️ Editing library match for: {query}")
+        return
+
+    lines = [f"✏️ Choose a library match for: {query}\n"]
+    for i, (_track_id, _path, meta) in enumerate(choices, 1):
+        lines.append(f"{i}. {meta.get('artist', 'Unknown')} - {meta.get('title', 'Unknown')}")
+    await message.reply_text(
+        '\n'.join(lines),
+        reply_markup=build_upload_choices_keyboard(choices),
     )
 
 
@@ -581,7 +935,7 @@ async def download_cover_image(update: Update) -> bytes | None:
             pass
 
 
-async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+async def apply_cover_data(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict, image_data: bytes):
     track_id = pending.get('track_id')
     track_id, path, meta = get_upload(context, track_id)
     if meta is None:
@@ -589,9 +943,8 @@ async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ This upload no longer exists.")
         return
 
-    image_data = await download_cover_image(update)
-    if not image_data:
-        await update.message.reply_text("⚠️ Send a JPEG or PNG image for the cover.")
+    if len(image_data) > COVER_IMAGE_MAX_BYTES:
+        await update.message.reply_text("⚠️ Cover image is too large.")
         return
 
     mime = detect_image_mime(image_data)
@@ -619,6 +972,31 @@ async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def handle_cover_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+    image_data = await download_cover_image(update)
+    if not image_data:
+        await update.message.reply_text("⚠️ Send a JPEG/PNG image or a supported URL for the cover.")
+        return
+    await apply_cover_data(update, context, pending, image_data)
+
+
+async def handle_cover_text(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+    url = extract_first_url(update.message.text or '')
+    if not url:
+        await update.message.reply_text("⚠️ Send a JPEG/PNG image, image URL, or YouTube/niconico/bilibili URL.")
+        return
+
+    await update.message.reply_text("🔎 Fetching cover image from URL...")
+    try:
+        image_data = await asyncio.to_thread(fetch_cover_from_url, url)
+    except Exception as e:
+        logger.warning(f"Cover URL fetch failed: {e}")
+        await update.message.reply_text(f"❌ Could not fetch cover: {e}")
+        return
+
+    await apply_cover_data(update, context, pending, image_data)
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming audio/document files."""
     user = update.effective_user
@@ -644,7 +1022,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif msg.document:
         file_name = msg.document.file_name or 'unknown'
         ext = Path(file_name).suffix.lower()
-        if ext not in ('.mp3', '.flac', '.m4a', '.ogg', '.wav', '.aac', '.wma', '.opus'):
+        if ext not in SUPPORTED_AUDIO_EXTS:
             await update.message.reply_text("⚠️ Not a supported audio format.")
             return
         file_obj = msg.document
@@ -730,6 +1108,11 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data.pop('edit_pending', None)
+    query = ' '.join(context.args).strip()
+    if query:
+        await show_library_search(update.message, context, query)
+        return
+
     await show_recent_uploads(update.message, context)
 
 
@@ -744,7 +1127,7 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending:
         return
     if pending.get('kind') == 'cover':
-        await update.message.reply_text("⚠️ Send a JPEG or PNG image for the cover, or use /edit to choose again.")
+        await handle_cover_text(update, context, pending)
         return
 
     field = pending.get('field')
@@ -843,6 +1226,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if meta is None:
             await query.edit_message_text("⚠️ This upload no longer exists.")
             return
+        remember_upload(context, path, meta, track_id)
         context.user_data['active_edit_upload_id'] = track_id
         await query.edit_message_text(
             f"✏️ Editing upload\n\n{format_track(path, meta)}",
@@ -862,7 +1246,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             f"🖼 Editing Cover\n\n"
             f"{format_track(path, meta)}\n\n"
-            f"Send a JPEG or PNG image."
+            f"Send a JPEG/PNG image, image URL, or YouTube/niconico/bilibili URL."
         )
         return
 
