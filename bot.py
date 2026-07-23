@@ -86,6 +86,7 @@ POST_HOOK_TIMEOUT = 60
 COVER_IMAGE_MAX_BYTES = 15 * 1024 * 1024
 COVER_PAGE_MAX_BYTES = 2 * 1024 * 1024
 SUPPORTED_AUDIO_EXTS = ('.mp3', '.flac', '.m4a', '.ogg', '.wav', '.aac', '.wma', '.opus')
+LRC_OFFSET_TAG_RE = re.compile(r'\[offset:\s*([+-]?\d+)\s*\]', re.IGNORECASE)
 COVER_FETCH_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (compatible; NavidromeUploaderBot/1.0)',
     'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
@@ -289,6 +290,130 @@ def write_metadata(filepath: Path, meta: dict):
         return
 
     raise ValueError(f"Unsupported metadata format: {ext}")
+
+
+def first_tag_text(tags, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = tags.get(key)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple)):
+            return str(value[0]) if value else ''
+        return str(value)
+    return ''
+
+
+def read_lyrics(filepath: Path) -> str:
+    """Read embedded LRC text from the same fields write_lyrics updates."""
+    audio = MutagenFile(str(filepath))
+    if audio is None or audio.tags is None:
+        return ''
+
+    tags = audio.tags
+    if filepath.suffix.lower() == '.mp3':
+        try:
+            for frame in tags.getall('USLT'):
+                text = getattr(frame, 'text', '')
+                if text:
+                    return str(text)
+        except AttributeError:
+            pass
+        for key in tags.keys():
+            if key.startswith('USLT'):
+                return str(tags[key])
+
+    if isinstance(audio, MP4):
+        return first_tag_text(tags, ('\xa9lyr',))
+
+    return first_tag_text(tags, ('LYRICS', 'lyrics', 'SYNCEDLYRICS', 'UNSYNCEDLYRICS', 'unsyncedlyrics'))
+
+
+def lrc_offset_line_match(line: str) -> re.Match | None:
+    return LRC_OFFSET_TAG_RE.fullmatch(line.strip())
+
+
+def get_lrc_offset_ms(lrc_text: str) -> int:
+    for line in lrc_text.splitlines():
+        match = lrc_offset_line_match(line)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
+def format_lrc_offset_tag(offset_ms: int) -> str:
+    sign = '+' if offset_ms >= 0 else ''
+    return f"[offset:{sign}{offset_ms}]"
+
+
+def line_ending(line: str) -> str:
+    if line.endswith('\r\n'):
+        return '\r\n'
+    if line.endswith('\n'):
+        return '\n'
+    return ''
+
+
+def default_lrc_newline(lrc_text: str) -> str:
+    return '\r\n' if '\r\n' in lrc_text else '\n'
+
+
+def set_lrc_offset(lrc_text: str, offset_ms: int) -> str:
+    tag = format_lrc_offset_tag(offset_ms)
+    lines = lrc_text.splitlines(keepends=True)
+    result = []
+    replaced = False
+
+    for line in lines:
+        if lrc_offset_line_match(line):
+            if not replaced:
+                result.append(tag + line_ending(line))
+                replaced = True
+            continue
+        result.append(line)
+
+    if replaced:
+        return ''.join(result)
+
+    newline = default_lrc_newline(lrc_text)
+    if result and result[0].startswith('\ufeff'):
+        result[0] = result[0].removeprefix('\ufeff')
+        return '\ufeff' + tag + newline + ''.join(result)
+    return tag + newline + ''.join(result)
+
+
+def format_offset_seconds(offset_ms: int) -> str:
+    seconds = abs(offset_ms) / 1000
+    return f"{seconds:g}s"
+
+
+def format_offset_effect(offset_ms: int) -> str:
+    if offset_ms > 0:
+        return f"lyrics appear {format_offset_seconds(offset_ms)} earlier"
+    if offset_ms < 0:
+        return f"lyrics appear {format_offset_seconds(offset_ms)} later"
+    return "lyrics timing unchanged"
+
+
+def parse_manual_offset_ms(text: str) -> int:
+    match = re.fullmatch(r'\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*s?\s*', text, re.IGNORECASE)
+    if not match:
+        raise ValueError("Send a number of seconds, for example 0.5 or -1.")
+    seconds = float(match.group(1))
+    if seconds == 0:
+        raise ValueError("Offset must not be 0.")
+    if abs(seconds) > 60:
+        raise ValueError("Offset must be between -60s and 60s.")
+    return int(round(seconds * 1000))
+
+
+def apply_lyrics_offset(path: Path, offset_delta_ms: int) -> int:
+    lrc = read_lyrics(path)
+    if not lrc:
+        raise ValueError("This track has no embedded lyrics to adjust.")
+
+    new_offset_ms = get_lrc_offset_ms(lrc) + offset_delta_ms
+    write_lyrics(path, set_lrc_offset(lrc, new_offset_ms))
+    return new_offset_ms
 
 
 def detect_image_mime(image_data: bytes) -> str | None:
@@ -707,6 +832,22 @@ def build_edit_keyboard(track_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def build_lyrics_edit_keyboard(track_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Search again", callback_data=f"edit_lyrics_search_{track_id}")],
+        [
+            InlineKeyboardButton("Lyrics earlier 1s", callback_data=f"edit_lrc_offset_{track_id}_1000"),
+            InlineKeyboardButton("Lyrics earlier 0.5s", callback_data=f"edit_lrc_offset_{track_id}_500"),
+        ],
+        [
+            InlineKeyboardButton("Lyrics later 0.5s", callback_data=f"edit_lrc_offset_{track_id}_-500"),
+            InlineKeyboardButton("Lyrics later 1s", callback_data=f"edit_lrc_offset_{track_id}_-1000"),
+        ],
+        [InlineKeyboardButton("Custom offset", callback_data=f"edit_lrc_offset_custom_{track_id}")],
+        [InlineKeyboardButton("Back", callback_data=f"edit_back_{track_id}")],
+    ])
+
+
 def build_upload_choices_keyboard(uploads: list) -> InlineKeyboardMarkup:
     buttons = []
     for track_id, _path, meta in uploads:
@@ -997,6 +1138,44 @@ async def handle_cover_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     await apply_cover_data(update, context, pending, image_data)
 
 
+async def handle_lyrics_offset_text(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict):
+    try:
+        offset_ms = parse_manual_offset_ms(update.message.text or '')
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+
+    track_id = pending.get('track_id')
+    track_id, path, meta = get_upload(context, track_id)
+    if meta is None:
+        context.user_data.pop('edit_pending', None)
+        await update.message.reply_text("⚠️ This upload no longer exists.")
+        return
+
+    try:
+        new_offset_ms = apply_lyrics_offset(path, offset_ms)
+    except Exception as e:
+        logger.warning(f"Lyrics offset edit failed: {e}")
+        await update.message.reply_text(
+            f"❌ Could not adjust lyrics offset: {e}",
+            reply_markup=build_lyrics_edit_keyboard(track_id),
+        )
+        return
+
+    context.user_data.pop('edit_pending', None)
+    scan_ok = trigger_scan()
+    scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
+    if scan_ok:
+        schedule_post_hook(str(path))
+
+    await update.message.reply_text(
+        f"✅ Updated lyrics offset tag: {format_lrc_offset_tag(new_offset_ms)}.\n"
+        f"🕒 Effect: {format_offset_effect(new_offset_ms)}.\n"
+        f"🔄 {scan_status}",
+        reply_markup=build_edit_keyboard(track_id),
+    )
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming audio/document files."""
     user = update.effective_user
@@ -1125,6 +1304,9 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pending = context.user_data.get('edit_pending')
     if not pending:
+        return
+    if pending.get('kind') == 'lyrics_offset':
+        await handle_lyrics_offset_text(update, context, pending)
         return
     if pending.get('kind') == 'cover':
         await handle_cover_text(update, context, pending)
@@ -1275,8 +1457,8 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    if data.startswith("edit_lyrics_"):
-        track_id = data.removeprefix("edit_lyrics_")
+    if data.startswith("edit_lyrics_search_"):
+        track_id = data.removeprefix("edit_lyrics_search_")
         track_id, path, meta = get_upload(context, track_id)
         if meta is None:
             await query.edit_message_text("⚠️ This upload no longer exists.")
@@ -1289,7 +1471,10 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         results = find_synced_lyrics(meta)
         if not results:
-            await query.edit_message_text("❌ No synced lyrics found.")
+            await query.edit_message_text(
+                "❌ No synced lyrics found.",
+                reply_markup=build_lyrics_edit_keyboard(track_id),
+            )
             return
 
         lyrics_id = remember_lyrics_results(context, track_id, results)
@@ -1303,11 +1488,28 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"{i+1}. {source}: {info.get('title','')[:30]}",
                 callback_data=f"edit_lrc_{track_id}_{lyrics_id}_{i}",
             )])
-        buttons.append([InlineKeyboardButton("Back", callback_data=f"edit_back_{track_id}")])
+        buttons.append([InlineKeyboardButton("Back", callback_data=f"edit_lyrics_{track_id}")])
 
         await query.edit_message_text(
             '\n'.join(text_parts),
             reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("edit_lyrics_"):
+        track_id = data.removeprefix("edit_lyrics_")
+        track_id, path, meta = get_upload(context, track_id)
+        if meta is None:
+            await query.edit_message_text("⚠️ This upload no longer exists.")
+            return
+
+        context.user_data['active_edit_upload_id'] = track_id
+        context.user_data.pop('edit_pending', None)
+        await query.edit_message_text(
+            f"🎤 Editing Lyrics\n\n"
+            f"{format_track(path, meta)}\n\n"
+            f"Search again to replace the lyrics, or adjust the embedded LRC offset tag.",
+            reply_markup=build_lyrics_edit_keyboard(track_id),
         )
         return
 
@@ -1320,6 +1522,62 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         await query.edit_message_text(
             f"✏️ Editing upload\n\n{format_track(path, meta)}",
+            reply_markup=build_edit_keyboard(track_id),
+        )
+        return
+
+    if data.startswith("edit_lrc_offset_custom_"):
+        track_id = data.removeprefix("edit_lrc_offset_custom_")
+        track_id, path, meta = get_upload(context, track_id)
+        if meta is None:
+            await query.edit_message_text("⚠️ This upload no longer exists.")
+            return
+
+        context.user_data['active_edit_upload_id'] = track_id
+        context.user_data['edit_pending'] = {'kind': 'lyrics_offset', 'track_id': track_id}
+        await query.edit_message_text(
+            f"🕒 Custom Lyrics Offset\n\n"
+            f"{format_track(path, meta)}\n\n"
+            f"Send seconds to add to the embedded LRC offset tag.\n"
+            f"Positive makes lyrics appear earlier; negative makes them appear later.\n"
+            f"Example: 0.5"
+        )
+        return
+
+    if data.startswith("edit_lrc_offset_"):
+        try:
+            rest = data.removeprefix("edit_lrc_offset_")
+            track_id, offset_text = rest.rsplit('_', 1)
+            offset_ms = int(offset_text)
+        except ValueError:
+            await query.edit_message_text("⚠️ Unknown lyrics offset.")
+            return
+
+        track_id, path, meta = get_upload(context, track_id)
+        if meta is None:
+            await query.edit_message_text("⚠️ This upload no longer exists.")
+            return
+
+        try:
+            new_offset_ms = apply_lyrics_offset(path, offset_ms)
+        except Exception as e:
+            logger.warning(f"Lyrics offset edit failed: {e}")
+            await query.edit_message_text(
+                f"❌ Could not adjust lyrics offset: {e}",
+                reply_markup=build_lyrics_edit_keyboard(track_id),
+            )
+            return
+
+        context.user_data.pop('edit_pending', None)
+        scan_ok = trigger_scan()
+        scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
+        if scan_ok:
+            schedule_post_hook(str(path))
+
+        await query.edit_message_text(
+            f"✅ Updated lyrics offset tag: {format_lrc_offset_tag(new_offset_ms)}.\n"
+            f"🕒 Effect: {format_offset_effect(new_offset_ms)}.\n"
+            f"🔄 {scan_status}",
             reply_markup=build_edit_keyboard(track_id),
         )
         return
