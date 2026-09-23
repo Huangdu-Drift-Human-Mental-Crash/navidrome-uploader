@@ -122,10 +122,14 @@ API_HASH=your_api_hash
 
 Without these, files >20MB will be rejected with a prompt.
 
-Pyrogram can optionally use `TgCrypto` to accelerate MTProto encryption, but it
-is not required for large-file downloads and is not installed by default.
-Current TgCrypto releases do not provide Windows wheels for recent CPython
-versions, so adding it may require Microsoft C++ Build Tools.
+The MTProto session is started together with the bot and kept open, so large
+downloads don't reconnect each time.
+
+On Linux, `requirements.txt` also installs `TgCrypto`, which accelerates MTProto
+encryption; without it, large downloads are CPU-bound and much slower. It is
+skipped on other platforms because current TgCrypto releases do not provide
+Windows wheels for recent CPython versions, so installing it there manually may
+require Microsoft C++ Build Tools.
 
 ## Post-processing hook
 
