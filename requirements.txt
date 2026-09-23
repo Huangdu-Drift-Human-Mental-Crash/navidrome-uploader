@@ -4,4 +4,3 @@ requests
 python-dotenv
 cryptography
 pyrogram
-tgcrypto
