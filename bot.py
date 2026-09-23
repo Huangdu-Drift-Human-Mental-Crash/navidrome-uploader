@@ -69,6 +69,7 @@ def ensure_default_event_loop():
 
 # Pyrogram client for large file downloads (>20MB)
 pyro_client = None
+pyro_start_lock = asyncio.Lock()
 if API_ID and API_HASH:
     # Pyrogram 2 expects a default event loop during import. Python 3.14 no
     # longer creates one implicitly for get_event_loop().
@@ -1589,7 +1590,7 @@ async def apply_cover_data(update: Update, context: ContextTypes.DEFAULT_TYPE, p
         return
 
     context.user_data.pop('edit_pending', None)
-    scan_ok = trigger_scan()
+    scan_ok = await asyncio.to_thread(trigger_scan)
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
     if scan_ok:
         schedule_post_hook(str(path))
@@ -1651,7 +1652,7 @@ async def handle_lyrics_offset_text(update: Update, context: ContextTypes.DEFAUL
         return
 
     context.user_data.pop('edit_pending', None)
-    scan_ok = trigger_scan()
+    scan_ok = await asyncio.to_thread(trigger_scan)
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
     if scan_ok:
         schedule_post_hook(str(path))
@@ -1698,34 +1699,39 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check file size (Telegram Bot API limit: 20MB)
     file_size_mb = file_obj.file_size / (1024 * 1024) if file_obj.file_size else 0
-    if file_size_mb > 20:
-        if not pyro_client:
-            await msg.reply_text(f"❌ File too large ({file_size_mb:.1f}MB). Set API_ID/API_HASH in .env for large file support.")
-            return
-        # Download via Pyrogram (MTProto, up to 2GB)
-        await msg.reply_text(f"⏬ Downloading large file via MTProto: {file_name} ({file_size_mb:.1f}MB)")
-        tmp_path = Path(tempfile.gettempdir()) / file_name
-        async with pyro_client:
+    if file_size_mb > 20 and not pyro_client:
+        await msg.reply_text(f"❌ File too large ({file_size_mb:.1f}MB). Set API_ID/API_HASH in .env for large file support.")
+        return
+
+    # A private temp dir per upload keeps concurrent uploads with the same name apart.
+    tmp_dir = Path(tempfile.mkdtemp(prefix='navidrome_upload_'))
+    tmp_path = tmp_dir / sanitize_filename(file_name)
+    try:
+        if file_size_mb > 20:
+            # Download via Pyrogram (MTProto, up to 2GB)
+            await msg.reply_text(f"⏬ Downloading large file via MTProto: {file_name} ({file_size_mb:.1f}MB)")
+            await ensure_pyrogram_started()
             pyro_msg = await pyro_client.get_messages(msg.chat_id, msg.message_id)
             await pyro_msg.download(file_name=str(tmp_path))
-    else:
-        await msg.reply_text(f"⏬ Downloading: {file_name}")
-        tg_file = await file_obj.get_file()
-        tmp_path = Path(tempfile.gettempdir()) / file_name
-        await tg_file.download_to_drive(str(tmp_path))
+        else:
+            await msg.reply_text(f"⏬ Downloading: {file_name}")
+            tg_file = await file_obj.get_file()
+            await tg_file.download_to_drive(str(tmp_path))
 
-    # Read metadata
-    meta = get_metadata(tmp_path)
-    ext = tmp_path.suffix
+        # Read metadata
+        meta = get_metadata(tmp_path)
+        ext = tmp_path.suffix
 
-    # Determine destination
-    dest_path = determine_path(meta, ext)
+        # Determine destination
+        dest_path = determine_path(meta, ext)
 
-    # Move to music folder
-    shutil.move(str(tmp_path), str(dest_path))
+        # Move to music folder
+        shutil.move(str(tmp_path), str(dest_path))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Trigger scan
-    scan_ok = trigger_scan()
+    scan_ok = await asyncio.to_thread(trigger_scan)
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
     if scan_ok:
         schedule_post_hook(str(dest_path))
@@ -1823,7 +1829,7 @@ async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_pending', None)
     remember_upload(context, final_path, new_meta, track_id)
 
-    scan_ok = trigger_scan()
+    scan_ok = await asyncio.to_thread(trigger_scan)
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
     if scan_ok:
         schedule_post_hook(str(final_path))
@@ -1934,7 +1940,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"🔍 Searching lyrics again...\n\n"
             f"{format_track(path, meta)}"
         )
-        results = find_synced_lyrics(meta)
+        results = await asyncio.to_thread(find_synced_lyrics, meta)
         if not results:
             await query.edit_message_text(
                 "❌ No synced lyrics found.",
@@ -2034,7 +2040,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         context.user_data.pop('edit_pending', None)
-        scan_ok = trigger_scan()
+        scan_ok = await asyncio.to_thread(trigger_scan)
         scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
         if scan_ok:
             schedule_post_hook(str(path))
@@ -2063,7 +2069,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
         source, info, lrc = results[idx]
         write_lyrics(path, lrc)
-        scan_ok = trigger_scan()
+        scan_ok = await asyncio.to_thread(trigger_scan)
         scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
         if scan_ok:
             schedule_post_hook(str(path))
@@ -2106,7 +2112,7 @@ async def handle_lyrics_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     source, info, lrc = results[idx]
     write_lyrics(path, lrc)
-    scan_ok = trigger_scan()
+    scan_ok = await asyncio.to_thread(trigger_scan)
     scan_status = "✓ Scan triggered" if scan_ok else "⚠️ Scan trigger failed"
     if scan_ok:
         schedule_post_hook(str(path))
@@ -2213,13 +2219,36 @@ async def register_bot_commands(application: Application):
         logger.error(f"Bot command registration failed: {e}")
 
 
+async def ensure_pyrogram_started():
+    """Start the shared MTProto session unless it is already connected."""
+    async with pyro_start_lock:
+        if not pyro_client.is_connected:
+            await pyro_client.start()
+
+
+async def post_init(application: Application):
+    await register_bot_commands(application)
+    if pyro_client:
+        try:
+            await ensure_pyrogram_started()
+            logger.info("Pyrogram MTProto session started")
+        except Exception as e:
+            logger.error(f"Pyrogram start failed, will retry on the next large file: {e}")
+
+
+async def post_shutdown(application: Application):
+    if pyro_client and pyro_client.is_connected:
+        await pyro_client.stop()
+
+
 def main():
     # python-telegram-bot 21 also expects an implicit loop in run_polling().
     ensure_default_event_loop()
-    builder = Application.builder().token(BOT_TOKEN)
+    # Handle updates concurrently so a long download doesn't queue other messages.
+    builder = Application.builder().token(BOT_TOKEN).concurrent_updates(True)
     if PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
-    builder = builder.post_init(register_bot_commands)
+    builder = builder.post_init(post_init).post_shutdown(post_shutdown)
     app = builder.build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", handle_start))
