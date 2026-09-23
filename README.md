@@ -9,6 +9,7 @@ Upload audio files to [Navidrome](https://www.navidrome.org/) via Telegram, with
 - Triggers Navidrome library scan via Subsonic API
 - Searches QQ Music / Kugou / Netease for synced lyrics and embeds them
 - `/edit` interactively edits recent uploads' artist/title/album/genre/cover and can replace lyrics
+- Imports songs from a local folder on demand with `/import`
 
 ## Requirements
 
@@ -37,6 +38,14 @@ NAVIDROME_URL=http://localhost:4533
 NAVIDROME_USER=admin
 NAVIDROME_PASS=your_password
 MUSIC_FOLDER=/path/to/your/music/library
+
+LOCAL_IMPORT_FOLDER=/path/to/incoming
+LOCAL_IMPORT_SETTLE_SECONDS=10
+LOCAL_IMPORT_TRANSCODE_ENABLED=false
+LOCAL_IMPORT_TRANSCODE_THRESHOLD_KBPS=320
+LOCAL_IMPORT_AAC_BITRATE_KBPS=256
+LOCAL_IMPORT_AAC_ENCODER=auto
+# LOCAL_IMPORT_TRANSCODE_TIMEOUT=1800
 ```
 
 ## Running
@@ -49,6 +58,49 @@ python bot.py                         # Linux/macOS
 ## Directory structure
 
 Files are stored as `{MUSIC_FOLDER}/{Artist}/{Title}.ext` (flat, no album subdirectories).
+
+## Local folder import
+
+Send `/import` to the bot to scan `LOCAL_IMPORT_FOLDER` recursively. Supported
+audio files are moved into `MUSIC_FOLDER` using the same metadata and
+destination-path logic as Telegram uploads. The command reports the imported and
+failed file counts. A single Navidrome scan is triggered after each non-empty
+batch, followed by `POST_HOOK` for every successfully imported track.
+
+Successfully imported tracks are added to the invoking user's recent `/edit`
+list. Tracks without embedded synced lyrics also run through the same lyrics
+search and interactive selection flow used by Telegram uploads. Batch lyrics
+search runs in a serialized background queue so other bot commands and lyrics
+buttons remain responsive.
+
+After a file is safely written into the music library, its source file is deleted
+from the incoming folder. If deleting the source fails, the new library file is
+rolled back and the source is retried later. Existing library paths are never
+overwritten; a numeric suffix such as `Title (2).flac` is used instead. Files
+newer than `LOCAL_IMPORT_SETTLE_SECONDS` are skipped until a later scan to avoid
+importing partially copied downloads.
+
+`LOCAL_IMPORT_FOLDER` and `MUSIC_FOLDER` must be separate, non-overlapping
+directories.
+
+### Optional AAC transcoding
+
+Set `LOCAL_IMPORT_TRANSCODE_ENABLED=true` to transcode local imports whose
+reported audio bitrate is higher than `LOCAL_IMPORT_TRANSCODE_THRESHOLD_KBPS`.
+The default threshold is 320 kbps and the output is AAC at 256 kbps in an
+`.m4a` container. Metadata is retained, and compatible embedded cover art is
+copied. The source file is deleted only after the M4A is successfully written.
+
+With `LOCAL_IMPORT_AAC_ENCODER=auto`, `qaac` is preferred and uses Apple AAC
+CVBR with the configured bitrate and encoder quality 2. If qaac is unavailable,
+FFmpeg's `aac_at` CVBR encoder is tried next. Other systems fall back to
+FFmpeg's native `aac` encoder at the configured bitrate; native AAC uses CBR
+rather than true CVBR. Set the encoder to `qaac`, `aac_at`, or `aac` to require
+a specific backend. Use `QAAC_COMMAND` or `FFMPEG_COMMAND` when an executable is
+not on `PATH`.
+
+`LOCAL_IMPORT_TRANSCODE_TIMEOUT` limits each encoder/remux operation and defaults
+to 1800 seconds.
 
 ## Editing recent uploads
 
@@ -69,6 +121,11 @@ API_HASH=your_api_hash
 ```
 
 Without these, files >20MB will be rejected with a prompt.
+
+Pyrogram can optionally use `TgCrypto` to accelerate MTProto encryption, but it
+is not required for large-file downloads and is not installed by default.
+Current TgCrypto releases do not provide Windows wheels for recent CPython
+versions, so adding it may require Microsoft C++ Build Tools.
 
 ## Post-processing hook
 

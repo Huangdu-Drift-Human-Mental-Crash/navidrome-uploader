@@ -8,6 +8,8 @@ import re
 import shlex
 import logging
 import secrets
+import subprocess
+import time
 import unicodedata
 from html.parser import HTMLParser
 from pathlib import Path
@@ -39,10 +41,38 @@ MUSIC_FOLDER = Path(os.getenv('MUSIC_FOLDER', './music'))
 POST_HOOK = os.getenv('POST_HOOK', '').strip()
 API_ID = os.getenv('API_ID', '').strip()
 API_HASH = os.getenv('API_HASH', '').strip()
+LOCAL_IMPORT_FOLDER = Path(os.getenv('LOCAL_IMPORT_FOLDER', './incoming'))
+LOCAL_IMPORT_SETTLE_SECONDS = max(0, int(os.getenv('LOCAL_IMPORT_SETTLE_SECONDS', '10')))
+LOCAL_IMPORT_TRANSCODE_ENABLED = os.getenv(
+    'LOCAL_IMPORT_TRANSCODE_ENABLED', ''
+).strip().lower() in ('1', 'true', 'yes', 'on')
+LOCAL_IMPORT_TRANSCODE_THRESHOLD_KBPS = max(
+    1, int(os.getenv('LOCAL_IMPORT_TRANSCODE_THRESHOLD_KBPS', '320'))
+)
+LOCAL_IMPORT_AAC_BITRATE_KBPS = max(
+    1, int(os.getenv('LOCAL_IMPORT_AAC_BITRATE_KBPS', '256'))
+)
+LOCAL_IMPORT_AAC_ENCODER = os.getenv('LOCAL_IMPORT_AAC_ENCODER', 'auto').strip() or 'auto'
+FFMPEG_COMMAND = os.getenv('FFMPEG_COMMAND', 'ffmpeg').strip() or 'ffmpeg'
+QAAC_COMMAND = os.getenv('QAAC_COMMAND', 'qaac').strip() or 'qaac'
+LOCAL_IMPORT_TRANSCODE_TIMEOUT = max(
+    60, int(os.getenv('LOCAL_IMPORT_TRANSCODE_TIMEOUT', '1800'))
+)
+
+
+def ensure_default_event_loop():
+    """Provide the implicit event loop expected by older async libraries."""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 # Pyrogram client for large file downloads (>20MB)
 pyro_client = None
 if API_ID and API_HASH:
+    # Pyrogram 2 expects a default event loop during import. Python 3.14 no
+    # longer creates one implicitly for get_event_loop().
+    ensure_default_event_loop()
     from pyrogram import Client as PyroClient
     proxy_cfg = None
     if PROXY_URL:
@@ -86,6 +116,7 @@ POST_HOOK_TIMEOUT = 60
 COVER_IMAGE_MAX_BYTES = 15 * 1024 * 1024
 COVER_PAGE_MAX_BYTES = 2 * 1024 * 1024
 SUPPORTED_AUDIO_EXTS = ('.mp3', '.flac', '.m4a', '.ogg', '.wav', '.aac', '.wma', '.opus')
+_resolved_aac_encoder = None
 LRC_OFFSET_TAG_RE = re.compile(r'\[offset:\s*([+-]?\d+)\s*\]', re.IGNORECASE)
 COVER_FETCH_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (compatible; NavidromeUploaderBot/1.0)',
@@ -175,6 +206,8 @@ def get_metadata(filepath: Path) -> dict:
     meta = {'artist': 'Unknown', 'title': filepath.stem, 'album': '', 'genre': ''}
     if getattr(audio, 'info', None) and getattr(audio.info, 'length', None):
         meta['duration'] = int(audio.info.length * 1000)
+    if getattr(audio, 'info', None) and getattr(audio.info, 'bitrate', None):
+        meta['bitrate'] = int(audio.info.bitrate)
 
     tags = audio.tags
     if tags is None:
@@ -223,6 +256,387 @@ def determine_path(meta: dict, ext: str) -> Path:
     dest_dir = MUSIC_FOLDER / artist
     dest_dir.mkdir(parents=True, exist_ok=True)
     return dest_dir / f"{title}{ext}"
+
+
+def local_file_fingerprint(path: Path) -> dict:
+    stat = path.stat()
+    return {'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+
+
+def available_destination(meta: dict, ext: str) -> Path:
+    """Choose a library path without overwriting an existing track."""
+    destination = determine_path(meta, ext)
+    if not destination.exists():
+        return destination
+
+    stem = destination.stem
+    for number in range(2, 10000):
+        candidate = destination.with_name(f"{stem} ({number}){destination.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Could not find an available destination for {destination}")
+
+
+def publish_without_overwrite(temp_path: Path, destination: Path):
+    """Atomically publish a completed file without replacing an existing track."""
+    try:
+        os.link(temp_path, destination)
+    except FileExistsError:
+        raise FileExistsError(f"Target file appeared during import: {destination}")
+    except OSError:
+        # Hard links may be unavailable on some filesystems. Reserve the final
+        # name exclusively before replacing our own zero-byte placeholder.
+        try:
+            descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise FileExistsError(f"Target file appeared during import: {destination}")
+        else:
+            os.close(descriptor)
+        try:
+            os.replace(temp_path, destination)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+    else:
+        temp_path.unlink()
+
+
+def resolve_aac_encoder() -> str:
+    """Prefer Apple AAC backends and fall back to native FFmpeg AAC."""
+    global _resolved_aac_encoder
+    if LOCAL_IMPORT_AAC_ENCODER != 'auto':
+        return LOCAL_IMPORT_AAC_ENCODER
+    if _resolved_aac_encoder:
+        return _resolved_aac_encoder
+
+    try:
+        qaac_check = subprocess.run(
+            [QAAC_COMMAND, '--check'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if qaac_check.returncode == 0:
+            _resolved_aac_encoder = 'qaac'
+            return _resolved_aac_encoder
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        result = subprocess.run(
+            [FFMPEG_COMMAND, '-hide_banner', '-encoders'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        encoders = f"{result.stdout}\n{result.stderr}"
+        _resolved_aac_encoder = 'aac_at' if re.search(r'\baac_at\b', encoders) else 'aac'
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"Could not inspect FFmpeg AAC encoders: {e}") from e
+    return _resolved_aac_encoder
+
+
+def aac_encoder_args() -> list[str]:
+    encoder = resolve_aac_encoder()
+    if encoder == 'qaac':
+        raise ValueError("qaac must be invoked through the Apple AAC pipeline.")
+    bitrate = f"{LOCAL_IMPORT_AAC_BITRATE_KBPS}k"
+    if encoder == 'aac_at':
+        return ['-c:a', 'aac_at', '-aac_at_mode', 'cvbr', '-b:a', bitrate]
+    if encoder == 'aac':
+        logger.warning(
+            "FFmpeg aac_at is unavailable; using native AAC at %s instead of true CVBR.",
+            bitrate,
+        )
+    return ['-c:a', encoder, '-b:a', bitrate]
+
+
+def run_ffmpeg_transcode(source_path: Path, output_path: Path, include_cover: bool):
+    command = [
+        FFMPEG_COMMAND,
+        '-nostdin',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-i',
+        str(source_path),
+        '-map',
+        '0:a:0',
+        '-map_metadata',
+        '0',
+    ]
+    if include_cover:
+        command.extend([
+            '-map',
+            '0:v?',
+            '-c:v',
+            'copy',
+            '-disposition:v:0',
+            'attached_pic',
+        ])
+    command.extend([
+        *aac_encoder_args(),
+        '-movflags',
+        '+faststart',
+        '-f',
+        'mp4',
+        str(output_path),
+    ])
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=LOCAL_IMPORT_TRANSCODE_TIMEOUT,
+    )
+    if result.returncode:
+        error = (result.stderr or result.stdout).strip()
+        raise RuntimeError(error[-2000:] or f"FFmpeg exited with code {result.returncode}")
+
+
+def transcode_to_m4a(source_path: Path, output_path: Path):
+    """Transcode to AAC/M4A, retrying without incompatible embedded artwork."""
+    if resolve_aac_encoder() == 'qaac':
+        transcode_with_qaac(source_path, output_path)
+        return
+
+    try:
+        run_ffmpeg_transcode(source_path, output_path, include_cover=True)
+    except RuntimeError as cover_error:
+        output_path.unlink(missing_ok=True)
+        logger.info("Retrying AAC transcode without embedded cover: %s", cover_error)
+        run_ffmpeg_transcode(source_path, output_path, include_cover=False)
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("FFmpeg did not produce a valid M4A file.")
+
+
+def run_qaac_encode(source_path: Path, encoded_path: Path):
+    """Decode with FFmpeg and pipe PCM to Apple's AAC encoder."""
+    with tempfile.TemporaryFile() as decoder_error:
+        decoder = subprocess.Popen(
+            [
+                FFMPEG_COMMAND,
+                '-nostdin',
+                '-hide_banner',
+                '-loglevel',
+                'error',
+                '-i',
+                str(source_path),
+                '-map',
+                '0:a:0',
+                '-f',
+                'wav',
+                '-',
+            ],
+            stdout=subprocess.PIPE,
+            stderr=decoder_error,
+        )
+        try:
+            encoder = subprocess.Popen(
+                [
+                    QAAC_COMMAND,
+                    '--cvbr',
+                    str(LOCAL_IMPORT_AAC_BITRATE_KBPS),
+                    '--quality',
+                    '2',
+                    '-o',
+                    str(encoded_path),
+                    '-',
+                ],
+                stdin=decoder.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            decoder.kill()
+            decoder.communicate()
+            raise
+
+        decoder.stdout.close()
+        try:
+            encoder_stdout, encoder_stderr = encoder.communicate(
+                timeout=LOCAL_IMPORT_TRANSCODE_TIMEOUT
+            )
+        except subprocess.TimeoutExpired as e:
+            encoder.kill()
+            decoder.kill()
+            encoder.communicate()
+            decoder.wait()
+            raise RuntimeError(
+                f"Apple AAC transcode timed out after {LOCAL_IMPORT_TRANSCODE_TIMEOUT}s"
+            ) from e
+
+        try:
+            decoder_returncode = decoder.wait(timeout=10)
+        except subprocess.TimeoutExpired as e:
+            decoder.kill()
+            decoder.wait()
+            raise RuntimeError("FFmpeg decoder did not exit after qaac finished.") from e
+
+        decoder_error.seek(0)
+        decoder_stderr = decoder_error.read()
+        if decoder_returncode:
+            error = decoder_stderr.decode(errors='replace').strip()
+            raise RuntimeError(error[-2000:] or f"FFmpeg decoder exited with code {decoder_returncode}")
+        if encoder.returncode:
+            error = (encoder_stderr or encoder_stdout).decode(errors='replace').strip()
+            raise RuntimeError(error[-2000:] or f"qaac exited with code {encoder.returncode}")
+    if not encoded_path.is_file() or encoded_path.stat().st_size == 0:
+        raise RuntimeError("qaac did not produce a valid M4A file.")
+
+
+def remux_qaac_output(
+    source_path: Path,
+    encoded_path: Path,
+    output_path: Path,
+    include_cover: bool,
+):
+    """Copy source metadata and compatible artwork onto qaac's M4A output."""
+    command = [
+        FFMPEG_COMMAND,
+        '-nostdin',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-i',
+        str(encoded_path),
+        '-i',
+        str(source_path),
+        '-map',
+        '0:a:0',
+        '-map_metadata',
+        '1',
+    ]
+    if include_cover:
+        command.extend([
+            '-map',
+            '1:v?',
+            '-disposition:v:0',
+            'attached_pic',
+        ])
+    command.extend([
+        '-c',
+        'copy',
+        '-movflags',
+        '+faststart',
+        '-f',
+        'mp4',
+        str(output_path),
+    ])
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=LOCAL_IMPORT_TRANSCODE_TIMEOUT,
+    )
+    if result.returncode:
+        error = (result.stderr or result.stdout).strip()
+        raise RuntimeError(error[-2000:] or f"FFmpeg remux exited with code {result.returncode}")
+
+
+def transcode_with_qaac(source_path: Path, output_path: Path):
+    encoded_path = output_path.with_name(
+        f".{output_path.name}.{secrets.token_hex(4)}.qaac.m4a"
+    )
+    try:
+        run_qaac_encode(source_path, encoded_path)
+        try:
+            remux_qaac_output(source_path, encoded_path, output_path, include_cover=True)
+        except RuntimeError as cover_error:
+            output_path.unlink(missing_ok=True)
+            logger.info("Retrying qaac metadata remux without embedded cover: %s", cover_error)
+            remux_qaac_output(source_path, encoded_path, output_path, include_cover=False)
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError("Apple AAC pipeline did not produce a valid M4A file.")
+    finally:
+        encoded_path.unlink(missing_ok=True)
+
+
+def scan_local_import_folder() -> tuple[
+    list[tuple[Path, Path, bool]],
+    list[tuple[Path, str]],
+    list[Path],
+]:
+    """Move stable audio files from the incoming folder into the library."""
+    source_root = LOCAL_IMPORT_FOLDER.resolve()
+    music_root = MUSIC_FOLDER.resolve()
+    if source_root == music_root or source_root in music_root.parents or music_root in source_root.parents:
+        raise ValueError("LOCAL_IMPORT_FOLDER and MUSIC_FOLDER must not overlap.")
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"Local import folder does not exist: {source_root}")
+
+    imported = []
+    failures = []
+    skipped = []
+    now = time.time()
+    candidates = sorted(
+        path for path in source_root.rglob('*')
+        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTS
+    )
+    for source_path in candidates:
+        try:
+            fingerprint = local_file_fingerprint(source_path)
+            if now - source_path.stat().st_mtime < LOCAL_IMPORT_SETTLE_SECONDS:
+                skipped.append(source_path)
+                continue
+
+            meta = get_metadata(source_path)
+            if not meta:
+                raise ValueError("Unsupported or unreadable audio file.")
+            transcode = (
+                LOCAL_IMPORT_TRANSCODE_ENABLED
+                and meta.get('bitrate', 0) > LOCAL_IMPORT_TRANSCODE_THRESHOLD_KBPS * 1000
+            )
+            destination = available_destination(meta, '.m4a' if transcode else source_path.suffix)
+            temp_destination = destination.with_name(
+                f".{destination.name}.{secrets.token_hex(4)}.importing"
+            )
+            try:
+                if transcode:
+                    transcode_to_m4a(source_path, temp_destination)
+                else:
+                    shutil.copy2(source_path, temp_destination)
+                if local_file_fingerprint(source_path) != fingerprint:
+                    raise RuntimeError("Source file changed while it was being copied.")
+                publish_without_overwrite(temp_destination, destination)
+                try:
+                    source_path.unlink()
+                except Exception:
+                    destination.unlink(missing_ok=True)
+                    raise
+            finally:
+                if temp_destination.exists():
+                    temp_destination.unlink()
+
+            imported.append((source_path, destination, transcode))
+            logger.info(
+                "Local import added %s as %s%s",
+                source_path,
+                destination,
+                " (transcoded)" if transcode else "",
+            )
+        except Exception as e:
+            logger.warning("Local import failed for %s: %s", source_path, e)
+            failures.append((source_path, str(e)))
+    return imported, failures, skipped
+
+
+async def run_local_import_once():
+    """Run one folder scan without blocking Telegram updates."""
+    imported, failures, skipped = await asyncio.to_thread(scan_local_import_folder)
+    if not imported:
+        return imported, failures, skipped, None
+
+    scan_ok = await asyncio.to_thread(trigger_scan)
+    if not scan_ok:
+        logger.warning("Navidrome scan trigger failed after importing %d local file(s)", len(imported))
+    else:
+        for _source, destination, _transcoded in imported:
+            schedule_post_hook(str(destination))
+        logger.info("Imported %d local file(s) and triggered Navidrome scan", len(imported))
+    return imported, failures, skipped, scan_ok
 
 
 def write_metadata(filepath: Path, meta: dict):
@@ -989,6 +1403,80 @@ def find_synced_lyrics(meta: dict) -> list:
     return unique[:6]
 
 
+async def offer_missing_lyrics(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    track_id: str,
+    path: Path,
+    meta: dict,
+) -> str:
+    """Offer interactive synced-lyrics choices for one track when needed."""
+    if has_synced_lyrics(path):
+        return 'present'
+
+    track_label = f"{meta.get('artist', 'Unknown')} - {meta.get('title', path.stem)}"
+    await message.reply_text(f"🔍 Searching lyrics: {track_label}")
+    try:
+        results = await asyncio.to_thread(find_synced_lyrics, meta)
+    except Exception as e:
+        logger.warning("Lyrics search failed for %s: %s", path, e)
+        await message.reply_text(f"❌ Lyrics search failed for {track_label}: {e}")
+        return 'failed'
+
+    if not results:
+        await message.reply_text(f"❌ No synced lyrics found for: {track_label}")
+        return 'missing'
+
+    lyrics_id = remember_lyrics_results(context, track_id, results)
+    buttons = []
+    text_parts = [f"🎤 Choose lyrics for {track_label}:\n"]
+    for i, (source, info, lrc) in enumerate(results):
+        preview = preview_lrc(lrc, 3).replace('\n', '\n   ')
+        text_parts.append(
+            f"{i+1}. ({source}) {info.get('artist','')} - {info.get('title','')}\n"
+            f"   {preview}\n"
+        )
+        buttons.append([InlineKeyboardButton(
+            f"{i+1}. {source}: {info.get('title','')[:30]}",
+            callback_data=f"lrc_{track_id}_{lyrics_id}_{i}",
+        )])
+    buttons.append([InlineKeyboardButton(
+        "⏭ Skip",
+        callback_data=f"lrc_skip_{track_id}_{lyrics_id}",
+    )])
+    await message.reply_text(
+        '\n'.join(text_parts),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return 'offered'
+
+
+async def process_imported_lyrics(
+    application: Application,
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    recent_tracks: list,
+):
+    """Process imported lyrics in a serialized background queue."""
+    lock = application.bot_data.setdefault('local_lyrics_lock', asyncio.Lock())
+    async with lock:
+        for track_id, destination, meta in recent_tracks:
+            try:
+                await offer_missing_lyrics(
+                    message,
+                    context,
+                    track_id,
+                    destination,
+                    meta,
+                )
+            except Exception as e:
+                logger.warning("Imported track post-processing failed for %s: %s", destination, e)
+                await message.reply_text(
+                    f"⚠️ Lyrics post-processing failed for {meta.get('artist', 'Unknown')} - "
+                    f"{meta.get('title', destination.stem)}: {e}"
+                )
+
+
 async def show_edit_menu(
     message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1253,30 +1741,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_id = remember_upload(context, dest_path, meta)
     logger.info(f"User {user.id} uploaded: {dest_path}")
 
-    # Search lyrics if missing
-    if not has_synced_lyrics(dest_path):
-        await msg.reply_text("🔍 Searching lyrics...")
-        results = find_synced_lyrics(meta)
-
-        if not results:
-            await msg.reply_text("❌ No synced lyrics found.")
-            return
-
-        lyrics_id = remember_lyrics_results(context, track_id, results)
-
-        # Build inline keyboard
-        buttons = []
-        text_parts = ["🎤 Choose lyrics:\n"]
-        for i, (source, info, lrc) in enumerate(results):
-            preview = preview_lrc(lrc, 3).replace('\n', '\n   ')
-            text_parts.append(f"{i+1}. ({source}) {info.get('artist','')} - {info.get('title','')}\n   {preview}\n")
-            buttons.append([InlineKeyboardButton(
-                f"{i+1}. {source}: {info.get('title','')[:30]}",
-                callback_data=f"lrc_{track_id}_{lyrics_id}_{i}",
-            )])
-        buttons.append([InlineKeyboardButton("⏭ Skip", callback_data=f"lrc_skip_{track_id}_{lyrics_id}")])
-
-        await msg.reply_text('\n'.join(text_parts), reply_markup=InlineKeyboardMarkup(buttons))
+    await offer_missing_lyrics(msg, context, track_id, dest_path, meta)
 
 
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1655,9 +2120,76 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎵 Navidrome Upload Bot\n\n"
         "Send me an audio file and I'll add it to your library.\n"
+        "Use /import to scan and import the configured local folder.\n"
         "Use /edit after uploading to edit metadata or replace lyrics.\n"
         "Supported: mp3, flac, m4a, ogg, wav, aac, wma, opus"
     )
+
+
+async def handle_local_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually scan and import files from LOCAL_IMPORT_FOLDER."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    if context.application.bot_data.get('local_import_running'):
+        await update.message.reply_text("⏳ A local import is already running.")
+        return
+
+    context.application.bot_data['local_import_running'] = True
+    await update.message.reply_text(f"🔍 Scanning local folder: {LOCAL_IMPORT_FOLDER}")
+    try:
+        imported, failures, skipped, scan_ok = await run_local_import_once()
+        recent_tracks = []
+        for _source, destination, _transcoded in imported:
+            try:
+                meta = await asyncio.to_thread(get_metadata, destination)
+            except Exception as e:
+                logger.warning("Could not read imported metadata for %s: %s", destination, e)
+                meta = None
+            if not meta:
+                meta = {
+                    'artist': 'Unknown',
+                    'title': destination.stem,
+                    'album': '',
+                    'genre': '',
+                }
+            track_id = remember_upload(context, destination, meta)
+            recent_tracks.append((track_id, destination, meta))
+
+        if scan_ok is True:
+            scan_status = "✓ Navidrome scan triggered"
+        elif scan_ok is False:
+            scan_status = "⚠️ Navidrome scan trigger failed"
+        else:
+            scan_status = "No Navidrome scan needed"
+        await update.message.reply_text(
+            "✅ Local import finished.\n"
+            f"🎵 Imported: {len(imported)}\n"
+            f"🎛 Transcoded: {sum(1 for _source, _destination, transcoded in imported if transcoded)}\n"
+            f"✏️ Added to recent edits: {len(recent_tracks)}\n"
+            f"⏭ Not stable yet: {len(skipped)}\n"
+            f"⚠️ Failed: {len(failures)}\n"
+            f"🔄 {scan_status}\n"
+            f"🎤 Lyrics search continues in the background"
+        )
+
+        if recent_tracks:
+            context.application.create_task(
+                process_imported_lyrics(
+                    context.application,
+                    update.message,
+                    context,
+                    recent_tracks,
+                ),
+                update=update,
+                name='local-import-lyrics',
+            )
+    except Exception as e:
+        logger.error("Manual local import failed: %s", e, exc_info=True)
+        await update.message.reply_text(f"❌ Local import failed: {e}")
+    finally:
+        context.application.bot_data['local_import_running'] = False
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1668,6 +2200,7 @@ async def register_bot_commands(application: Application):
     """Register commands shown in Telegram's command menu."""
     commands = [
         BotCommand("start", "Show help"),
+        BotCommand("import", "Import songs from local folder"),
         BotCommand("edit", "Edit recent uploads"),
     ]
     try:
@@ -1681,6 +2214,8 @@ async def register_bot_commands(application: Application):
 
 
 def main():
+    # python-telegram-bot 21 also expects an implicit loop in run_polling().
+    ensure_default_event_loop()
     builder = Application.builder().token(BOT_TOKEN)
     if PROXY_URL:
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
@@ -1688,6 +2223,7 @@ def main():
     app = builder.build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("import", handle_local_import))
     app.add_handler(CommandHandler("edit", handle_edit))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.ALL | filters.PHOTO, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_text))
